@@ -8,12 +8,11 @@ import scala.tools.refactoring.common.SilentTracing
 import scala.tools.refactoring.tests.util.TestHelper.PrepResultWithChanges
 import org.scalameter.Gen
 import org.scalameter.Key.exec
-import scala.tools.refactoring.common.ConsoleTracing
 
 object RenameBenchmark extends Quickbenchmark with TestRefactoring {
   private def prepareAndRenameTo(name: String)(pro: FileSet): PrepResultWithChanges = {
     val impl = new TestRefactoringImpl(pro) {
-      val refactoring = new Rename with SilentTracing with TestProjectIndex
+      val refactoring = new Rename with TestProjectIndex
     }
     PrepResultWithChanges(Some(impl.preparationResult()), impl.performRefactoring(name))
   }

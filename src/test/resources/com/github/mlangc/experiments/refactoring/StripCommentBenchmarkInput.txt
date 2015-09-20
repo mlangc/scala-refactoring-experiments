@@ -1,0 +1,5320 @@
+/*
+ * Copyright 2005-2010 LAMP/EPFL
+ */
+
+package scala.tools.refactoring
+package sourcegen
+
+import scala.reflect.internal.util.RangePosition
+
+import language.implicitConversions
+
+trait ReusingPrinter extends TreePrintingTraversals with AbstractPrinter {
+
+  outer: LayoutHelper with common.Tracing with common.PimpedTrees with common.CompilerAccess with Formatting with Indentations =>
+
+  import global._
+
+  object reusingPrinter extends TreePrinting with PrintingUtils
+    with MiscPrinters
+    with MethodCallPrinters
+    with WhilePrinters
+    with PatternMatchingPrinters
+    with TypePrinters
+    with FunctionPrinters
+    with ImportPrinters
+    with PackagePrinters
+    with TryThrowPrinters
+    with ClassModulePrinters
+    with IfPrinters
+    with ValDefDefPrinters
+    with SuperPrinters
+    with BlockPrinters
+    with LiteralPrinters {
+
+    override def dispatchToPrinter(t: Tree, ctx: PrintingContext): Fragment = {
+
+      val originalIndentation = outer.indentationString(t)
+
+      val newCtx = ctx.copy(ind = ctx.ind.setTo(originalIndentation))
+
+      val (leadingParent, trailingParent) = surroundingLayoutFromParentsAndSiblings(t)
+
+      val printedFragment = if (ctx.changeSet hasChanged t) {
+        super.dispatchToPrinter(t, newCtx)
+      } else if (t.pos.isTransparent) {
+        trace("Not in change set but transparent, continue printing...")
+        /*
+         * If we have a position that is not in the changeset, we can stop printing
+         * and just use the existing source code. But there are potentially many
+         * trees with the same transparent position besides a non-transparent range,
+         * so we need to look further until we find that non-transparent range and
+         * can take its source code.
+         *
+         * */
+        super.dispatchToPrinter(t, newCtx)
+      } else {
+        trace("Not in change set, keep original code.")
+        val end = endPositionAtEndOfSourceFile(t.pos)
+        val start = adjustedStartPosForSourceExtraction(t, t.pos).start
+        Fragment(t.pos.source.content.slice(start, end).mkString)
+      }
+
+      val indentedFragment = {
+        if (ctx.ind.needsToBeFixed(originalIndentation, leadingParent, l(newCtx), r(newCtx), trailingParent)) {
+          val indentedLeadingLayout = ctx.ind.fixIndentation(leadingParent.asText, originalIndentation)
+          val indentedCode = ctx.ind.fixIndentation(printedFragment.asText, originalIndentation)
+          Fragment(indentedLeadingLayout, indentedCode, trailingParent)
+        } else {
+          Fragment(leadingParent, printedFragment.toLayout, trailingParent)
+        }
+      } \\ (trace("Result " + getSimpleClassName(t) + ": %s", _))
+
+      indentedFragment
+    }
+  }
+
+  trait PrintingUtils {
+    this: TreePrinting =>
+
+    implicit def allowSurroundingWhitespace(s: String) = Requisite.allowSurroundingWhitespace(s)
+
+    def l(implicit ctx: PrintingContext) = leadingLayoutForTree(ctx.parent)
+
+    def r(implicit ctx: PrintingContext) = trailingLayoutForTree(ctx.parent)
+
+    def orig(tree: Tree): Tree = findOriginalTree(tree) getOrElse {
+      trace("Original tree not found for %s, returning EmptyTree.", tree)
+      EmptyTree
+    }
+
+    /** Returns a NameTree for a tree's name and gives it the position of
+     *  the original tree's name.
+     */
+    def nameOf(tree: Tree): NameTree = {
+      val namePos = orig(tree).namePosition
+      outer.NameTree(tree.nameString) setPos namePos
+    }
+
+    /** Prints the children of the tree, surrounded with the layout from
+     *  the existing code.
+     */
+    def printChildren(tree: Tree)(implicit ctx: PrintingContext) = {
+      l ++ children(tree).foldLeft(EmptyFragment: Fragment)(_ ++ p(_)) ++ r
+    }
+
+    /** This is the default handler that is called for non-overriden methods.
+     */
+    override def default(tree: Tree)(implicit ctx: PrintingContext): Fragment = {
+      printChildren(tree)
+    }
+
+    def printTemplate(t: Template, printExtends: Boolean)(implicit ctx: PrintingContext) = {
+
+      val TemplateExtractor(params, earlyBody, parents, self, body) = t
+
+      val preBody = {
+        val xtends = Requisite.anywhere("extends", " extends ")
+        val parents_ = pp(parents, before = if (printExtends) xtends else "", separator = " with ")
+
+        val params_ = params.headOption map (pms => pp(pms, separator = ", ", after = Requisite.anywhere(")"))) getOrElse EmptyFragment
+        val SplitAtOpeningBrace = "(.*?)(\\s?\\{.*)".r
+        val hasNoClassParameters = params == Nil :: Nil || params == Nil
+
+        if (hasNoClassParameters) {
+          l.asText match {
+            case SplitAtOpeningBrace(before, after) =>
+              Layout(before) ++ pp(earlyBody) ++ parents_.ifNotEmpty(_ ++ Requisite.Blank) ++ Layout(after)
+            case _ =>
+              pp(earlyBody) ++ l ++ parents_
+          }
+        } else {
+          params_.trailing.asText match {
+            case SplitAtOpeningBrace(before, after) if earlyBody.isEmpty =>
+              l ++ params_.dropTrailingLayout ++ Layout(before) ++ parents_ ++ Layout(after)
+            case _ =>
+              l ++ params_ ++ pp(earlyBody) ++ parents_
+          }
+        }
+      }
+
+      def hasNewlyIntroducedBody = orig(t) match {
+        case TemplateExtractor(_, _, _, origSelf, origBody) =>
+          origBody.isEmpty && isEmptyTree(origSelf) && !body.isEmpty
+        case _ => false
+      }
+
+      def isExistingBodyAllOnOneLine = {
+        val tplStartLine = t.pos.source.offsetToLine(t.pos.start)
+        val tplEndLine = t.pos.source.offsetToLine(t.pos.end)
+        tplStartLine == tplEndLine
+      }
+
+      if (hasNewlyIntroducedBody) {
+        val openingBrace = " {" + ctx.newline + indentation
+        val closingBrace = ctx.newline + indentation + "}"
+        val bodyResult = ppi(body, separator = newline)
+
+        preBody ++ p(self) ++ openingBrace ++ bodyResult ++ closingBrace
+      } else if (isExistingBodyAllOnOneLine) {
+        preBody ++ p(self) ++ ppi(body, separator = newline) ++ r
+      } else {
+        val body_ = ppi(body, separator = newline)
+        val trailing = r
+        val hasOpeningBrace = body_.leading.contains("{") || trailing.contains("{")
+        val needToPrintOpeningBrace = !hasOpeningBrace && trailing.contains("}") && !preBody.asText.endsWith("{")
+
+        val self_ = if (needToPrintOpeningBrace) {
+          EmptyFragment ++ " {" ++ p(self) ++ indentedNewline
+        } else if (hasOpeningBrace) {
+          p(self) // if the opening brace already exists, there's also a newline present
+        } else {
+          p(self) ++ indentedNewline
+        }
+
+        preBody ++ self_ ++ body_ ++ trailing
+      }
+    }
+  }
+
+  trait WhilePrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def LabelDef(tree: LabelDef, name: Name, params: List[Tree], rhs: Tree)(implicit ctx: PrintingContext) = {
+
+      val labelName = nameOf(tree)
+
+      rhs match {
+        case Block(stats, If(cond, _, _)) =>
+          l ++ pp(stats) ++ p(labelName) ++ Layout("(") ++ p(cond) ++ r
+
+        case If(cond, Block((body: Block) :: Nil, _), _) =>
+          l ++ p(labelName) ++ Layout("(") ++ p(cond) ++ Layout(")") ++ p(body) ++ r
+
+        case If(cond, ifTrue, _) =>
+          l ++ p(labelName) ++ Layout("(") ++ p(cond) ++ Layout(")") ++ pi(ifTrue) ++ r
+      }
+    }
+  }
+
+  trait PatternMatchingPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def CaseDef(tree: CaseDef, pat: Tree, guard: Tree, body: Tree)(implicit ctx: PrintingContext) = {
+      val arrowReq = new Requisite {
+        def isRequired(l: Layout, r: Layout) = {
+          !(l.contains("=>") || r.contains("=>") || p(body).asText.startsWith("=>"))
+        }
+
+        // It's just nice to have a whitespace before and after the arrow
+        def getLayout = Layout(" => ")
+      }
+
+      val ifReq = new Requisite {
+        def isRequired(l: Layout, r: Layout) = {
+          !(l.contains("if") || r.contains("if"))
+        }
+
+        // Leading and trailing whitespace is required in some cases!
+        // e.g. `case i if i > 0 => ???` becomes `case iifi > 0 => ???` otherwise
+        def getLayout = Layout(" if ")
+      }
+
+      body match {
+
+        case b @ BlockExtractor(body) if !b.hasExistingCode =>
+          val x = (l ++ p(pat) ++ p(guard)) ++ arrowReq
+          x ++ Fragment(ctx.newline + indentation) ++ ppi(body, separator = indentedNewline) ++ r
+
+        case _ if tree.pos.isTransparent =>
+          EmptyFragment
+
+        case _ =>
+          val patAndGuard =
+            if (guard == EmptyTree)
+              l ++ p(pat, after = arrowReq)
+            else
+              l ++ p(pat) ++ p(guard, before = ifReq, after = arrowReq)
+
+          patAndGuard ++ pi(body) ++ r
+      }
+    }
+
+    override def Alternative(tree: Alternative, trees: List[Tree])(implicit ctx: PrintingContext) = {
+      l ++ pp(trees, separator = " | ") ++ r
+    }
+
+    override def Bind(tree: Bind, name: Name, body: Tree)(implicit ctx: PrintingContext) = {
+      val nameOrig = nameOf(tree)
+
+      body match {
+
+        case body: Bind =>
+          l ++ p(nameOrig) ++ p(body, before = "(", after = ")") ++ r
+
+        case body: Typed =>
+          l ++ p(nameOrig) ++ p(body) ++ r
+
+        case _ =>
+          l ++ p(nameOrig) ++ p(body, before = " @ ") ++ r
+      }
+    }
+
+    override def UnApply(tree: UnApply, fun: Tree, args: List[Tree])(implicit ctx: PrintingContext) = {
+      l ++ p(fun) ++ pp(args, separator = ", ", before = "(", after = ")") ++ r
+    }
+
+    override def Match(tree: Match, selector: Tree, cases: List[Tree])(implicit ctx: PrintingContext) = {
+      if (keepTree(selector)) {
+        l ++ p(selector) ++ " match" ++ pp(cases) ++ r
+      } else {
+        l ++ pp(cases) ++ r
+      }
+    }
+  }
+
+  trait MethodCallPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def Select(tree: Select, qualifier: Tree, selector: Name)(implicit ctx: PrintingContext) = {
+
+      lazy val nameOrig = nameOf(tree)
+
+      qualifier match {
+
+        // skip <init> from constructor calls
+        case _ if selector == nme.CONSTRUCTOR =>
+          l ++ p(qualifier) ++ r
+
+        case _: This if qualifier.pos == NoPosition =>
+          l ++ Fragment(tree.symbol.nameString) ++ r
+
+        case _ if (qualifier.pos == NoPosition || tree.pos.sameRange(qualifier.pos))
+          && (selector == nme.unapply || selector == nme.apply || selector == nme.unapplySeq) =>
+          if (qualifier.pos == NoPosition) {
+            l ++ p(qualifier) ++ r
+          } else {
+            // at the moment, the qualifier incorrectly has a TransParent position, so we remove that
+            l ++ p(qualifier setPos (qualifier.pos withPoint qualifier.pos.point)) ++ r
+          }
+
+        case _: Apply if selector.toString.startsWith("unary_") =>
+
+          val printedQualifier = p(qualifier)
+
+          if (printedQualifier.asText.contains(" ")) //XXX better check to see if we need to print parens
+            l ++ p(nameOrig) ++ "(" ++ printedQualifier ++ ")" ++ r
+          else
+            l ++ p(nameOrig) ++ printedQualifier ++ r
+
+        case _ if selector.toString.startsWith("unary_") =>
+          l ++ p(nameOrig) ++ p(qualifier) ++ r
+
+        case Apply(s @ global.Select(qual, _), Nil) =>
+
+          val betweenQualifierAndName = {
+            val name = nameOf(s)
+            if (qual.pos.isRange && name.pos.isRange)
+              between(qual, name)
+            else NoLayout
+          }
+
+          val _qualifier = p(qualifier)
+
+          if (!_qualifier.asText.matches("^\\s*\\(.*\\)\\s*") && betweenQualifierAndName.contains(" ")) {
+            l ++ "(" ++ _qualifier ++ ")" ++ " " ++ p(nameOrig) ++ r
+          } else {
+            l ++ _qualifier ++ p(nameOrig) ++ r
+          }
+
+        case _ =>
+
+          val _q = {
+            // Workaround for SI-5064
+            if (tree.pos.sameRange(qualifier.pos) && qualifier.pos.isTransparent)
+              EmptyFragment
+            else
+              p(qualifier)
+          }
+          val _n = {
+            // the selector isn't visible in the source,
+            // that's the case e.g. in for expressions.
+            if (tree.samePos(qualifier) && qualifier.pos.isRange && !qualifier.isInstanceOf[This])
+              EmptyFragment
+            else p(nameOrig)
+          }
+
+          def hasNoSeparator = {
+            val between = (_q.trailing ++ _n.leading).asText
+            !between.contains(" ") && !between.contains(".")
+          }
+
+          def startsWithChar = _q.asText.matches(".*[^ ]$")
+          def endsWithChar = _n.asText.matches("^[^ ].*")
+
+          def qualifierHasNoDot = qualifier match {
+            case Apply(s @ global.Select(qual, name), _) if s.pos.isRange && qual.pos.isRange =>
+
+              val sn: global.Name = s.name
+              val nt = new NameTree(sn).setPos(s.namePosition)
+
+              val b = between(qual, nt)
+              !b.contains(".")
+            case _ => false
+          }
+
+          def hasClosingParensBetweenQualifierAndSelector = {
+            qualifier.pos.isRange && nameOrig.pos.isRange && {
+              between(qualifier, nameOrig).contains(")")
+            }
+          }
+          if (qualifier.pos.isRange && tree.pos.start < qualifier.pos.start && nameOrig.nameString.endsWith(":")) {
+            l ++ _n ++ " " ++ _q ++ r
+          } else if (startsWithChar && endsWithChar && hasNoSeparator) {
+            l ++ _q ++ " " ++ _n ++ r
+          } else if (qualifierHasNoDot && _n.leading.contains(".")) {
+            l ++ "(" ++ _q ++ ")" ++ _n ++ r
+          } else if (hasClosingParensBetweenQualifierAndSelector) {
+            l ++ "(" ++ _q ++ ")" ++ _n ++ r
+          } else {
+            l ++ _q ++ _n ++ r
+          }
+      }
+    }
+
+    override def TypeApply(tree: TypeApply, fun: Tree, args: List[Tree])(implicit ctx: PrintingContext) = {
+      val _fun = fun match {
+        /*
+         * We have to check if the TypeApply is the generator of a for-comprehension.
+         * There are several indicators: equal position of the fun and the TypeApply,
+         * the name and if the name is not at the expected position in the source code,
+         * then we assume that this is a for comprehension and only print the qualifier
+         * of the function.
+         * */
+        case global.Select(qual, nme) if fun.pos.eq(tree.pos) && fun.pos.isRange && {
+          nme == global.nme.foreach || nme == global.nme.map || nme == global.nme.flatMap
+        } && {
+          val nmeInSource = betweenPointAndEnd(fun).asText
+          nmeInSource != nme.toTermName.toString
+        } => p(qual)
+        case _ => p(fun)
+      }
+
+      val _args = pp(args, separator = ", ", before = "[", after = "]")
+
+      l ++ _fun.dropTrailingLayout ++ balanceParens('[', ']')(_fun.trailing ++ _args ++ r)
+    }
+
+    override def Apply(tree: Apply, fun: Tree, args: List[Tree])(implicit ctx: PrintingContext) = {
+
+      def balanceParensAroundCall(recv: Fragment, args: Fragment) = {
+        /*
+         * The opening parenthesis could also be trailing the function, if that's
+         * the case we include the trailing layout in the balanceParens call.
+         */
+        if (recv.trailing.contains("(")) {
+          val _arg = balanceParens('(', ')')(recv.trailing ++ args ++ r)
+          l ++ recv.dropTrailingLayout ++ _arg
+        } else {
+          val _arg = balanceParens('(', ')')(args ++ r)
+          l ++ recv ++ _arg
+        }
+      }
+
+      (fun, args) match {
+
+        case (global.Select(select: Select, nme.update), args) if fun.pos == select.pos && args.nonEmpty =>
+
+          args match {
+            case arg :: Nil =>
+              l ++ p(select) ++ p(arg) ++ r
+
+            case _ =>
+              val updateArgs = args.init
+              val rhs = args.last
+              l ++ p(select) ++ "(" ++ pp(updateArgs, separator = ", ") ++ ")" ++ " = " ++ p(rhs) ++ r
+          }
+
+        // handle e.g. a += 1 which is a = (a + 1)
+        case (_: Select, ((arg1: Apply) :: _)) if tree.pos.sameRange(arg1.pos) && arg1.pos.isTransparent =>
+          l ++ p(fun) ++ between(fun, arg1.args.head) ++ pp(arg1.args) ++ r
+
+        // x :: xs in pattern match:
+        case (EmptyTree, ((_: Bind) :: (_: Bind) :: _)) if tree.tpe.toString.contains("::") =>
+          l ++ pp(args) ++ r
+
+        case (_, ((_: Bind) :: (_: Bind) :: _)) =>
+          val _fun = p(fun)
+          val hasInfixExtractor = (l ++ _fun).asText.isEmpty
+          val _args = if (hasInfixExtractor) {
+            pp(args)
+          } else {
+            pp(args, before = if (l contains "(") NoRequisite else "(", separator = ", ", after = ")")
+          }
+          l ++ _fun ++ _args ++ r
+
+        // ifs in for comprehensions:
+        case (fun: Select, arg :: Nil) if keepTree(fun.qualifier) && fun.name.toString == "withFilter" =>
+          l ++ p(fun.qualifier) ++ " if " ++ p(arg) ++ r
+
+        case (fun: Select, arg :: Nil) if keepTree(fun.qualifier) /*has receiver*/
+          || fun.name.toString.endsWith("$eq") /*assigns*/ =>
+
+          balanceParensAroundCall(p(fun), p(arg))
+
+        case (TypeApply(_: Select, _), (arg @ Function(_, _: Match)) :: Nil) =>
+          l ++ p(fun) ++ p(arg) ++ r
+
+        case (fun @ TypeApply(receiver: Select, _), NoFunction(arg) :: Nil) if receiver != null && keepTree(fun) =>
+
+          val isReceiverMethodCallWithDot = {
+            receiver.qualifier.pos.isRange && betweenEndAndPoint(receiver.qualifier, receiver).contains(".")
+          }
+
+          if (isReceiverMethodCallWithDot || !keepTree(receiver.qualifier) || l.contains("(") || r.contains(")")) {
+            l ++ p(fun) ++ p(arg, before = Requisite.anywhere("("), after = Requisite.anywhere(")")) ++ r
+          } else {
+            val arg_ = p(arg)
+            if (arg_.asText.matches("""(?ms)\s*\{.*""") && !arg_.asText.matches("""(?ms).*\}\s*""")) {
+              l ++ p(fun) ++ arg_ ++ indentedNewline ++ "}" ++ r
+            } else {
+              l ++ p(fun) ++ arg_ ++ r
+            }
+          }
+
+        case (fun, arg :: Nil) if !keepTree(fun) =>
+          l ++ p(arg) ++ r
+
+        case (EmptyTree, args) =>
+          l ++ pp(args, separator = ", ", before = "(", after = ")") ++ r
+
+        /* Workaround for for-comprehensions. Because they are not represented with
+         * their own ASTs, we sometimes need to work around some issues. This is for
+         * the following case:
+         *
+         *   for(`arg` <- `fun`) yield body
+         *
+         * We discover this pattern by the transparent function with a position
+         * smaller than the preceding (in the AST) Apply call. */
+        case (generator, (f @ Function(arg :: _, body)) :: Nil) if f.pos.isTransparent && generator.pos != NoPosition &&
+          arg.pos.startOrPoint < generator.pos.startOrPoint &&
+          between(arg, generator).contains("<-") =>
+
+          val src = betweenStartAndPoint(tree)
+
+          val layoutAfterGenerator = {
+            /*
+             * Handle 3 ways to write for-comprehensions:
+             *
+             * for {
+             *   ...
+             * } ...
+             *
+             * for { ... }
+             *
+             * for ( ... )
+             *
+             * */
+            if (src.matches("""(?ms).*\{\s*\n.*""")) {
+              indentedNewline ++ "}"
+            } else if (src.contains("{")) {
+              allowSurroundingWhitespace("}")
+            } else {
+              allowSurroundingWhitespace(")")
+            }
+          }
+
+          /* We only regenerate the code of the generator and the body, this will fail
+           * to pick up any changes in the `arg`!
+           *
+           * Generic layout handling will remove a closing `)`, so we re-add it */
+          val _generator = p(generator, after = layoutAfterGenerator)
+
+          val isUnit = generator match {
+            case generator: TypeApply =>
+              generator.tpe match {
+                case MethodType(_, TypeRef(_, sym, _)) =>
+                  sym.name == tpnme.Unit
+                case _ => false
+              }
+            case _ => false
+          }
+
+          val bodyPrefix = if (isUnit) " " else " yield "
+
+          if (body.pos.isRange && between(generator, body).matches("""(?ms).*\{\s*$""")) {
+            val nextLine = if (body.pos.line > generator.pos.line) {
+              ctx.newline + ctx.ind.incrementDefault.current
+            } else " "
+
+            l ++ _generator ++ p(body, before = bodyPrefix + "{" + nextLine) ++ r
+          } else {
+            l ++ _generator ++ p(body, before = bodyPrefix) ++ r
+          }
+
+        case (fun, Nil) =>
+
+          // Calls to methods without `()` are represented by a select and no apply.
+          if (r.matches("""^\s*\)""")) {
+            l ++ p(fun) ++ "(" ++ r
+          } else {
+            l ++ p(fun) ++ r
+          }
+
+        case (fun, args) if !keepTree(fun) /* Constructors, Tuples */ =>
+          val _args = pp(args, separator = ("," ++ Requisite.Blank), before = Requisite.anywhere("("), after = Requisite.anywhere(")"))
+          l ++ _args ++ r
+
+        case (fun, args) =>
+          val _args = pp(args, separator = ("," ++ Requisite.Blank), before = "(", after = Requisite.anywhere(")"))
+          balanceParensAroundCall(p(fun), _args)
+      }
+    }
+  }
+
+  trait TypePrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def TypeTree(tree: TypeTree)(implicit ctx: PrintingContext) = {
+      if (tree.original == null && !tree.pos.isTransparent) {
+        tree.tpe match {
+          case ref @ RefinedType(_ :: parents, _) =>
+            l ++ Fragment(parents mkString " ") ++ r
+          case t =>
+            l ++ Fragment(t.toString) ++ r
+        }
+
+      } else {
+        tree.tpe match {
+          case typeRef @ TypeRef(tpe, sym, parents) if tree.original == null && definitions.isFunctionType(typeRef) && !parents.isEmpty =>
+            l ++ typeToString(tree, typeRef) ++ r
+          case _ =>
+            l ++ p(tree.original) ++ r
+        }
+      }
+    }
+
+    override def TypeDef(tree: TypeDef, mods: List[ModifierTree], name: Name, tparams: List[Tree], rhs: Tree)(implicit ctx: PrintingContext) = {
+      val nameTree = nameOf(tree)
+      l ++ pp(mods ::: nameTree :: Nil, separator = Requisite.Blank) ++ pp(tparams, before = "[" /*, after = "]"*/ ) ++ p(rhs) ++ r
+    }
+
+    override def SelectFromTypeTree(tree: SelectFromTypeTree, qualifier: Tree, selector: Name)(implicit ctx: PrintingContext) = {
+      l ++ p(qualifier) ++ p(nameOf(tree)) ++ r
+    }
+
+    override def CompoundTypeTree(tree: CompoundTypeTree, tpl: Template)(implicit ctx: PrintingContext) = {
+      balanceParens('{', '}') {
+        printTemplate(tpl, printExtends = false)
+      }
+    }
+
+    override def ExistentialTypeTree(tree: ExistentialTypeTree, tpt: Tree, whereClauses: List[Tree])(implicit ctx: PrintingContext) = {
+      whereClauses match {
+        // [_]
+        case (t: TypeDef) :: Nil if t.symbol.isSynthetic =>
+          p(tpt) ++ p(t, before = "[", after = "]")
+
+        case _ =>
+          p(tpt) ++ pp(whereClauses, before = " forSome {", after = " }")
+      }
+    }
+
+    override def AppliedTypeTree(tree: AppliedTypeTree, tpt: Tree, args: List[Tree])(implicit ctx: PrintingContext) = {
+
+      def printFunctionType() = {
+        if (args.size == 1) {
+          l ++ "() => " ++ p(args.head) ++ r
+        } else if (args.size == 2) {
+          val x = p(args.head)
+          l ++ p(args.head) ++ p(args.last) ++ r
+        } else {
+          val arguments = args.init
+          val ret = args.last
+          l ++ pp(arguments, before = "(", separator = ", ", after = Requisite.anywhere(")")) ++ p(ret) ++ r
+        }
+      }
+
+      tpt match {
+        case Select(_, tpnme.REPEATED_PARAM_CLASS_NAME | tpnme.BYNAME_PARAM_CLASS_NAME) =>
+          l ++ p(args.head) ++ r
+        case _ if isEmptyTree(tpt) && args.size == 1 =>
+          l ++ p(args.head) ++ r
+        case Select(_, name) if name.toString.matches("Function\\d+") =>
+          printFunctionType()
+        case EmptyTree =>
+          printFunctionType()
+        case _ =>
+          l ++ p(tpt) ++ pp(args, before = "[", separator = ", ", after = "]") ++ r
+      }
+    }
+
+    override def TypeBoundsTree(tree: TypeBoundsTree, lo: Tree, hi: Tree)(implicit ctx: PrintingContext) = {
+      val lo_ = if (lo.pos.isDefined) p(lo) else EmptyFragment
+      val hi_ = if (hi.pos.isDefined) p(hi) else EmptyFragment
+
+      lo_ ++ hi_
+    }
+  }
+
+  trait FunctionPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def Function(tree: Function, vparams: List[ValDef], body: Tree)(implicit ctx: PrintingContext) = {
+      body match {
+
+        case b @ BlockExtractor(body) if !b.hasExistingCode =>
+          l ++ pp(vparams) ++ (ctx.newline + indentation) ++ ppi(body, separator = indentedNewline) ++ r
+
+        case _ =>
+          val params = pp(vparams, separator = ", ")
+          val bdy = p(body)
+
+          if (r.contains(")")) {
+            l ++ params ++ "(" ++ p(body) ++ r
+          } else {
+            l ++ params ++ p(body) ++ r
+          }
+      }
+    }
+  }
+
+  trait ImportPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def Import(tree: Import, expr: Tree, selectors: List[ImportSelectorTree])(implicit ctx: PrintingContext) = {
+
+      val sp = spacingAroundMultipleImports
+
+      val selectors_ = pp(selectors, before = sp, separator = ", ", after = sp)
+
+      if (selectors.size > 1) {
+        l ++ "import " ++ p(expr, after = ".") ++ "{" ++ selectors_ ++ "}" ++ r
+      } else {
+        l ++ "import " ++ p(expr, after = ".") ++ selectors_ ++ r
+      }
+    }
+  }
+
+  trait PackagePrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def PackageDef(tree: PackageDef, pid: RefTree, stats: List[Tree])(implicit ctx: PrintingContext) = context("PackagePrinters.PackageDef") {
+
+      val originalPackageDef = findOriginalTree(tree)
+
+      def isPackageObjectWithNoTopLevelImports = originalPackageDef exists {
+        case global.PackageDef(_, ModuleDef(_, nme.PACKAGEkw, _) :: Nil) => true
+        case _ => false
+      }
+
+      def isOriginallyFromDefaultPackage = originalPackageDef exists {
+        case global.PackageDef(Ident(nme.EMPTY_PACKAGE_NAME), _) => true
+        case _ => false
+      }
+
+      val (importStats, rest) = stats.span(_.isInstanceOf[Import])
+
+      val imports = importStats.collect {
+        case t @ Import(expr, _) if expr != EmptyTree => t
+      }
+
+      val restStats = rest flatMap {
+        case global.PackageDef(pid, stats) if pid.name == nme.EMPTY_PACKAGE_NAME => stats
+        case t => List(t)
+      }
+
+      def hasOnlyNewImports = !imports.isEmpty && !imports.exists(_.pos.isRange)
+
+      val pid_ = {
+        // default package:
+        if (pid.name == nme.EMPTY_PACKAGE_NAME) {
+          EmptyFragment
+        } else {
+          l ++ p(pid, before = "package" ++ Requisite.Blank)
+        }
+      }
+
+      trace("XXX: trailingLayout: %s", r)
+      if (isPackageObjectWithNoTopLevelImports) {
+        trace("isPackageObjectWithNoTopLevelImports")
+        pp(imports, separator = indentedNewline, after = indentedNewline) ++ pid_ ++ pp(restStats, separator = indentedNewline) ++ r
+      } else {
+        val imports_ = if (hasOnlyNewImports) {
+          trace("XXX: hasOnlyNewImports")
+          pp(imports, separator = indentedNewline) ++ newline ++ indentedNewline
+        } else {
+          trace("XXX: !hasOnlyNewImports")
+          pp(imports, separator = indentedNewline)
+        }
+
+        val tmpRemainingStats = pp(restStats, separator = newline ++ indentedNewline)
+        trace("XXX: tmpRemainingStats: %s", tmpRemainingStats)
+
+        pid_.ifNotEmpty(_ ++ newline ++ indentedNewline) ++ imports_ ++ pp(restStats, separator = newline ++ indentedNewline) ++ r
+      }
+    } \\ { res =>
+      trace("Result:\n %s", res)
+    }
+  }
+
+  trait TryThrowPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def Try(tree: Try, block: Tree, catches: List[Tree], finalizer: Tree)(implicit ctx: PrintingContext) = {
+      block match {
+
+        case b @ BlockExtractor(block) if !b.hasExistingCode =>
+          l ++ indentation ++ ppi(block, separator = indentedNewline) ++ pp(catches) ++ p(finalizer) ++ r
+
+        case _ =>
+          printChildren(tree)
+      }
+    }
+  }
+
+  trait ClassModulePrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def ClassDef(tree: ClassDef, mods: List[ModifierTree], name: Name, tparams: List[Tree], impl: Template)(implicit ctx: PrintingContext) = {
+      val className = if (tree.symbol.isAnonymousClass)
+        EmptyFragment
+      else
+        p(nameOf(tree))
+
+      val modifiers = pp(mods, separator = Requisite.Blank, after = Requisite.Blank)
+      val typeParams = pp(tparams, separator = "," ++ Requisite.Blank, before = "[", after = "]")
+      val template = p(impl)
+
+      val beforeTpl = l ++ modifiers ++ className ++ typeParams
+
+      if (beforeTpl.asText.endsWith(" ") && template.asText.startsWith(" ")) {
+        beforeTpl ++ Layout(template.asText.tail)
+      } else {
+        beforeTpl ++ template
+      } ++ r
+    }
+
+    override def ModuleDef(tree: ModuleDef, mods: List[ModifierTree], name: Name, impl: Template)(implicit ctx: PrintingContext) = {
+      val nameTree = p(nameOf(tree))
+      val impl_ = p(impl)
+      if (nameTree.asText.endsWith(" ") && impl_.asText.startsWith(" ")) {
+        l ++ pp(mods) ++ Layout(nameTree.asText.init) ++ impl_ ++ r
+      } else {
+        l ++ pp(mods) ++ nameTree ++ impl_ ++ r
+      }
+    }
+
+    override def Template(tree: Template, parents: List[Tree], self: Tree, body: List[Tree])(implicit ctx: PrintingContext) = {
+      printTemplate(tree, printExtends = !tree.isTemplateForAnonymousClass)
+    }
+  }
+
+  trait IfPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def If(tree: If, cond: Tree, thenp: Tree, elsep: Tree)(implicit ctx: PrintingContext) = {
+
+      val o = orig(tree).asInstanceOf[If]
+
+      val _else = {
+
+        /*
+         * Printing the else branch is tricky because of how {} are handled in the AST,
+         * but only if the else branch already existed:
+         */
+        val elseBranchAlreadyExisted = keepTree(o.elsep) && o.elsep.pos.isRange
+
+        if (elseBranchAlreadyExisted) {
+
+          val layout = between(o.thenp, o.elsep).asText
+          val l = Requisite.anywhere(layout.replaceAll("(?ms)else\\s*?\r?\n\\s*$", "else "))
+
+          val curlyBracesAlreadyExist = layout.contains("{")
+          val originalElseHasNoBlock = !o.elsep.isInstanceOf[Block]
+
+          elsep match {
+
+            /*
+             * The existing else branch was enclosed by {} but contained only a single
+             * statement.
+             * */
+            case BlockExtractor(body) if originalElseHasNoBlock && curlyBracesAlreadyExist =>
+              pp(body, before = l, separator = Requisite.newline(ctx.ind.current + ctx.ind.defaultIncrement, ctx.newline))
+
+            /*
+             * If there was no block before and also no curly braces, we have to write
+             * them now (indirectly through the Block), but we don't want to add any
+             * indentation.
+             * */
+            case elsep: Block =>
+              outer.print(elsep, ctx) ifNotEmpty (_ ++ (NoRequisite, l))
+
+            /* If it's a single statements, we print it indented: */
+            case _ =>
+              pi(elsep, before = Requisite.anywhere(layout))
+          }
+
+        } else {
+          val l = indentedNewline ++ "else" ++ Requisite.newline(ctx.ind.current + ctx.ind.defaultIncrement, ctx.newline)
+          pi(elsep, before = l)
+        }
+      }
+
+      val (_thenLeadingLayout, _then) = {
+        thenp match {
+          case block: Block =>
+            p(block)
+          case _ if keepTree(o.thenp) && o.thenp.pos.isRange =>
+            val layout = between(o.cond, o.thenp).asText
+            val printedThen = pi(thenp)
+
+            if (layout.contains("{") && !printedThen.asText.matches("(?ms)^\\s*\\{.*")) {
+              val (left, right) = layout.splitAt(layout.indexOf(")") + 1)
+              pi(thenp, before = Requisite.anywhere(right))
+            } else {
+              pi(thenp)
+            }
+
+          case _ =>
+            pi(thenp)
+        }
+      } match {
+        case f => (f.leading, f.dropLeadingLayout)
+      }
+
+      val _cond = balanceParens('(', ')') {
+        // we want to balance the parens around the condition and all adjacent layout
+        l ++ p(cond, before = "(", after = Requisite.anywhere(")")) ++ _thenLeadingLayout
+      }
+
+      val condAndThenOnSameLine = (cond.pos, thenp.pos) match {
+        case (NoPosition, _) => false
+        case (_, NoPosition) => true
+        case (p1, p2) => p1.line == p2.line
+      }
+
+      val hasSeparatorBetweenCondAndThen = {
+        _then.asText.startsWith(" ") || _cond.asText.endsWith(" ")
+      }
+
+      if (condAndThenOnSameLine && !hasSeparatorBetweenCondAndThen) {
+        _cond ++ " " ++ _then ++ _else ++ r
+      } else {
+        _cond ++ _then ++ _else ++ r
+      }
+    }
+  }
+
+  trait ValDefDefPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def ValDef(tree: ValDef, mods: List[ModifierTree], name: Name, tpt: Tree, rhs: Tree)(implicit ctx: PrintingContext) = {
+      val nameTree = nameOf(tree)
+
+      val modsAndName = rhs match {
+        // It looks like we're in a "multiple assignment", then we don't print
+        // the modifiers to avoid getting val (val x, val y) = ...
+        case Select(qual, _) if qual.symbol.isSynthetic =>
+          nameTree :: Nil
+        case _ =>
+          mods ::: nameTree :: Nil
+      }
+
+      // Handle right-associate methods, where there's a synthetic value that holds
+      // the argument that gets passed. Strange, but seems to work..
+      if (tree.symbol.isSynthetic && (!tree.pos.includes(rhs.pos) || tree.pos.point > tree.pos.end)) {
+        p(tpt) ++ p(rhs) ++ r
+      } else {
+        val mods_ = pp(modsAndName, separator = Requisite.Blank)
+        val resultType = p(tpt, before = Requisite.allowSurroundingWhitespace(":", ": "))
+        val body = p(rhs)
+        val noEqualNeeded = body == EmptyFragment || rhs.tpe == null || (rhs.tpe != null && rhs.tpe.toString == "Unit")
+
+        if (noEqualNeeded)
+          l ++ mods_ ++ resultType ++ body ++ r
+        else
+          l ++ mods_ ++ resultType ++ Requisite.anywhere("=", " = ") ++ body ++ r
+      }
+    }
+
+    override def DefDef(tree: DefDef, mods: List[ModifierTree], name: Name, tparams: List[Tree], vparamss: List[List[ValDef]], tpt: Tree, rhs: Tree)(implicit ctx: PrintingContext) = {
+      val nameTree = nameOf(tree)
+      val modsAndName = pp(mods ::: nameTree :: Nil, separator = Requisite.Blank)
+
+      val parameters = {
+        // The `)` is always removed from the layout, so if we have an empty
+        // parameter list and `()` in the source, we need to insert it here.
+        if (vparamss == List(List()) && modsAndName.asText.endsWith("(")) {
+          Fragment(")")
+        } else {
+          tree.explicitVParamss.map { vparams =>
+            pp(vparams, before = "(", separator = ", ", after = ")")
+          }.foldLeft(EmptyFragment: Fragment)(_ ++ _)
+        }
+      }
+
+      val typeParameters = {
+
+        def mergeTypeParameters(ts: List[Tree]): Fragment = ts match {
+          case Nil =>
+            EmptyFragment
+          case (x: TypeDef) :: Nil =>
+            p(x)
+          case (x: TypeDef) :: (y: TypeDef) :: rest =>
+            p(x) ++ ", " ++ mergeTypeParameters(y :: rest)
+          case (x: TypeDef) :: rest =>
+            val (bounds, next) = rest.span(!_.isInstanceOf[TypeDef])
+            val current = pp(x :: bounds, separator = ": ")
+            if (next.isEmpty) {
+              current
+            } else {
+              current ++ ", " ++ mergeTypeParameters(next)
+            }
+          case _ =>
+            EmptyFragment
+        }
+
+        val _tparams = mergeTypeParameters(tree.tparamsWithContextBounds) ifNotEmpty {
+          _ ++ (before = "[", after = Requisite.anywhere("]"))
+        }
+
+        if (parameters.isEmpty && !_tparams.isEmpty && _tparams.trailing.contains("(")) {
+          _tparams.toLayout ++ Requisite.anywhere(")")
+        } else {
+          _tparams
+        }
+      }
+
+      val body = p(rhs)
+
+      def existsTptInFile = tpt match {
+        case tpt: TypeTree =>
+          lazy val textInFile = betweenStartAndEnd(tpt).asText
+          tpt.pos.isRange && (textInFile == tpt.toString() || textInFile == tpt.original.toString())
+        case _ => false
+      }
+
+      val resultType =
+        if (body == EmptyFragment && !existsTptInFile)
+          EmptyFragment
+        else
+          p(tpt, before = Requisite.allowSurroundingWhitespace(":", ": "))
+
+      def hasEqualInSource = {
+        val originalDefDef = orig(tree)
+        (originalDefDef :: children(originalDefDef)).filter(_.pos.isRange).reverse match {
+          case last :: secondlast :: _ =>
+            between(secondlast, last).contains("=")
+          case _ => false
+        }
+      }
+
+      val noEqualNeeded = {
+        body == EmptyFragment || rhs.tpe == null || (rhs.tpe != null && rhs.tpe.toString == "Unit")
+      }
+
+      if (noEqualNeeded && !hasEqualInSource) {
+        l ++ modsAndName ++ typeParameters ++ parameters ++ resultType ++ body ++ r
+      } else {
+        l ++ modsAndName ++ typeParameters ++ parameters ++ resultType ++ Requisite.anywhere("=", " = ") ++ body ++ r
+      }
+    }
+  }
+
+  trait SuperPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def SuperConstructorCall(tree: SuperConstructorCall, clazz: global.Tree, args: List[global.Tree])(implicit ctx: PrintingContext) = {
+      l ++ p(clazz) ++ pp(args, separator = ", ", before = "(", after = ")") ++ r
+    }
+
+    override def Super(tree: Super, qual: Tree, mix: Name)(implicit ctx: PrintingContext) = {
+
+      // duplicate of pretty printer!
+      val q = qual match {
+        case This(qual: Name) if qual.toString == "" => EmptyFragment
+        case This(qual: Name) => Fragment(qual.toString + ".")
+        case _ => p(qual)
+      }
+
+      val m = if (mix.toString == "") "" else "[" + mix + "]"
+
+      l ++ q ++ Fragment("super" + m) ++ r
+
+    }
+  }
+
+  trait LiteralPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def Literal(tree: Literal, value: Constant)(implicit ctx: PrintingContext) = {
+      if (value.tag == StringTag) {
+        val escaped = value.stringValue.replace("""\""", """\\""")
+        l ++ Fragment("\"" + escaped + "\"") ++ r
+      } else if (value.isNumeric) {
+        Fragment((l ++ betweenStartAndEnd(tree) ++ r).asText)
+      } else if (charAtTreeStartPos(tree) == Some('{') && charBeforeTreeEndPos(tree) == Some('}')) {
+        /*
+         * Scala 2.9:
+         *
+         * Empty RHS of DefDefs are Literals
+         * */
+        trace("Literal tree is empty { }")
+        Fragment((l ++ betweenStartAndEnd(tree) ++ r).asText)
+      } else if (isClassTag(value)) {
+        val tpe = value.tpe match {
+          case TypeRef(_, _, arg :: Nil) =>
+            arg
+          case tpe =>
+            tpe.toString
+        }
+        l ++ Fragment("classOf[" + tpe.toString + "]") ++ r
+      } else {
+        l ++ Fragment(value.stringValue) ++ r
+      }
+    }
+
+    def charAtTreeStartPos(t: Tree) = t.pos match {
+      case range: RangePosition => Some(t.pos.source.content(t.pos.start))
+      case _ => None
+    }
+
+    def charBeforeTreeEndPos(t: Tree) = t.pos match {
+      case range: RangePosition => Some(t.pos.source.content(t.pos.end - 1))
+      case _ => None
+    }
+  }
+
+  trait BlockPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def Block(tree: Block, stats: List[Tree])(implicit ctx: PrintingContext) = {
+
+      def allTreesOnSameLine(ts: List[Tree]): Boolean = {
+        val poss = ts map (_.pos)
+        poss.forall(_.isRange) && (poss.map(_.line).distinct.length <= 1)
+      }
+
+      if (stats.size > 1 && allTreesOnSameLine(stats)) {
+        l ++ pp(stats) ++ r
+      } else {
+        if (l.contains("{") && !stats.head.hasExistingCode) {
+          val rest = ppi(stats, separator = newline) ++ r
+          l ++ Requisite.newline(ctx.ind.current, ctx.newline, force = true) ++ rest
+
+        } else if (stats.size == 2 && !stats(0).hasExistingCode && stats(1).hasExistingCode) {
+          val stats_ = pp(stats, separator = indentedNewline)
+          l ++ stats_ ++ r
+        } else {
+          l ++ ppi(stats, separator = newline) ++ r
+        }
+      }
+    }
+  }
+
+  trait MiscPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def Assign(tree: Assign, lhs: Tree, rhs: Tree)(implicit ctx: PrintingContext) = {
+      rhs match {
+        // Handle assignments like +=, which are desugared in the AST
+        case Apply(Select(_, name), _) if rhs.pos.isTransparent && name.isOperatorName =>
+          // the rhs already contains the layout for the operator, note that this might
+          // break should the refactoring change the operator name as well.
+          l ++ p(rhs) ++ r
+        case _ =>
+          l ++ p(lhs, after = "=") ++ p(rhs) ++ r
+      }
+    }
+
+    override def MultipleAssignment(tree: MultipleAssignment, extractor: Tree, values: List[ValDef], rhs: Tree)(implicit ctx: PrintingContext) = {
+      extractor match {
+        case EmptyTree =>
+          l ++ pp(values, separator = ", ") ++ ")" ++ p(rhs) ++ r
+        case _ =>
+          l ++ "val " ++ p(extractor) ++ " = " ++ p(rhs) ++ r
+      }
+    }
+
+    override def New(tree: New, tpt: Tree)(implicit ctx: PrintingContext) = {
+      if (tree.pos.start > tree.pos.point) {
+        Fragment("new ") ++ l ++ p(tpt) ++ r
+      } else {
+        Fragment("new") ++ l ++ p(tpt) ++ r
+      }
+    }
+
+    override def This(tree: This, qual: Name)(implicit ctx: PrintingContext) = {
+      l ++ Fragment((if (qual.toString == "") "" else qual + ".") + "this") ++ r
+    }
+
+    override def Ident(tree: Ident, name: Name)(implicit ctx: PrintingContext) = {
+      l ++ Fragment(tree.nameString) ++ r
+    }
+
+    override def ModifierTree(tree: ModifierTree, flag: Long)(implicit ctx: PrintingContext) = {
+      l ++ Fragment(tree.nameString) ++ r
+    }
+
+    override def NameTree(tree: Tree)(implicit ctx: PrintingContext) = {
+      if (tree.pos.isTransparent) {
+        l ++ EmptyFragment ++ r
+      } else {
+        l ++ Fragment(tree.nameString) ++ r
+      }
+    }
+
+    override def NamedArgument(tree: Tree, name: NameTree, rhs: Tree)(implicit ctx: PrintingContext) = {
+      l ++ p(name) ++ Requisite.Blank ++ "=" ++ Requisite.Blank ++ p(rhs) ++ r
+    }
+  }
+}
+          
+
+/*
+ * Copyright 2005-2010 LAMP/EPFL
+ */
+
+package scala.tools.refactoring
+package sourcegen
+
+import scala.tools.nsc.symtab.Flags
+import Requisite.anywhere
+import scala.reflect.NameTransformer
+
+import language.implicitConversions
+
+trait PrettyPrinter extends TreePrintingTraversals with AbstractPrinter {
+
+  outer: common.PimpedTrees with common.CompilerAccess with common.Tracing with Indentations with LayoutHelper with Formatting =>
+
+  import global._
+
+  object prettyPrinter extends TreePrinting with PrintingUtils
+    with MiscPrinters
+    with MethodCallPrinters
+    with WhilePrinters
+    with PatternMatchingPrinters
+    with TypePrinters
+    with FunctionPrinters
+    with ImportPrinters
+    with PackagePrinters
+    with TryThrowPrinters
+    with ClassModulePrinters
+    with IfPrinters
+    with ValDefDefPrinters
+    with SuperPrinters
+    with BlockPrinters
+    with LiteralPrinters
+
+  trait PrintingUtils {
+    this: TreePrinting =>
+
+    implicit def allowSurroundingWhitespace(s: String) = Requisite.allowSurroundingWhitespace(s)
+
+    def printParameterList(vparamss: List[List[ValDef]], existingLayout: String)(implicit ctx: PrintingContext) = vparamss match {
+      // no parameter list, not even an empty one
+      case Nil =>
+        NoLayout
+      case vparamss =>
+
+        val layout = Layout(
+          vparamss map { vparams =>
+            pp(vparams, before = "(", after = anywhere(")"), separator = ("," ++ Requisite.Blank))
+          } mkString "" // ?
+          )
+
+        val hasOpenCloseParens = existingLayout.matches(".*\\(.*\\).*")
+        val hasOpenParens = !hasOpenCloseParens && existingLayout.matches(".*\\(.*")
+
+        if (layout.asText.isEmpty && hasOpenParens) {
+          Layout(")")
+        } else if (layout.asText.isEmpty && !hasOpenCloseParens) {
+          // we want to at least empty parens, the case without any parameters is handled above
+          Layout("()")
+        } else {
+          layout
+        }
+
+    }
+
+    def printTemplate(tpl: Template, printExtends: Boolean)(implicit ctx: PrintingContext) = tpl match {
+      case TemplateExtractor(params, earlyBody, parents, self, body) =>
+
+        val sup = if (earlyBody.isEmpty) {
+          parents match {
+            case Nil => EmptyFragment
+            case parent :: traits =>
+              val superclass = {
+                if (printExtends)
+                  p(parent, before = " extends ")
+                else
+                  p(parent)
+              }
+              superclass ++ pp(traits, before = " with ", separator = " with ")
+          }
+        } else {
+          ppi(earlyBody, before = " extends {" ++
+            newlineIndentedToChildren, after = indentedNewline ++ "}", separator = newlineIndentedToChildren) ++
+            pp(parents, before = " with ", separator = " with ")
+        }
+
+        val self_ = (self, body) match {
+          case (EmptyTree, body) =>
+            ppi(body, before = " {" ++ newlineIndentedToChildren, separator = newlineIndentedToChildren, after = indentedNewline ++ "}")
+          case (self, Nil) =>
+            pi(self, before = " {" ++ newlineIndentedToChildren, after = " =>" ++ indentedNewline ++ "}")
+          case (self, body) =>
+            pi(self, before = " {" ++ newlineIndentedToChildren, after = " =>") ++
+              ppi(body, before = newlineIndentedToChildren, separator = newlineIndentedToChildren, after = indentedNewline ++ "}")
+        }
+
+        val params_ = printParameterList(params, "()")
+
+        params_ ++ sup ++ self_
+    }
+  }
+
+  trait WhilePrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def LabelDef(tree: LabelDef, name: Name, params: List[Tree], rhs: Tree)(implicit ctx: PrintingContext) = {
+      rhs match {
+
+        case Block(stats, If(cond, _, _)) =>
+          Layout("do ") ++ pp(stats) ++ Fragment(" while") ++ Layout("(") ++ p(cond) ++ Layout(")")
+
+        case If(cond, Block((body: Block) :: Nil, _), _) =>
+          Fragment(tree.nameString) ++ Layout("(") ++ p(cond) ++ Layout(")") ++ p(body)
+
+        case If(cond, ifTrue, _) =>
+          Fragment(tree.nameString) ++ Layout("(") ++ p(cond) ++ Layout(")") ++ p(ifTrue)
+      }
+    }
+  }
+
+  trait PatternMatchingPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def CaseDef(tree: CaseDef, pat: Tree, guard: Tree, body: Tree)(implicit ctx: PrintingContext) = {
+      // we have to get rid of the `if` if we print a case that had a guard before but not anymore
+      val patP = """(.*) if """.r
+      val patFrag = patP.findFirstIn(p(pat).asText) match {
+        case Some(patP(patStr)) if guard == EmptyTree => Fragment(patStr)
+        case _ => p(pat)
+      }
+      
+      val arrowReq = new Requisite {
+        def isRequired(l: Layout, r: Layout) = {
+          !(l.contains("=>") || r.contains("=>"))
+        }
+
+        def getLayout = Layout(" => ")
+      }
+
+      Layout("case ") ++ patFrag ++ p(guard, before = " if ") ++ p(body, before = arrowReq)
+    }
+
+    override def Alternative(tree: Alternative, trees: List[Tree])(implicit ctx: PrintingContext) = {
+      pp(trees, separator = " | ")
+    }
+
+    override def Star(tree: Star, elem: Tree)(implicit ctx: PrintingContext) = {
+      p(elem) ++ Layout("*")
+    }
+
+    override def Bind(tree: Bind, name: Name, body: Tree)(implicit ctx: PrintingContext) = {
+      body match {
+
+        case body: Typed =>
+          Layout(name.toString) ++ p(body, before = ": ")
+
+        case body: Bind =>
+          Layout(name.toString) ++ p(body, before = " @ (", after = ")")
+
+        case _ =>
+          Layout(name.toString) ++ p(body, before = " @ ")
+      }
+    }
+
+    override def UnApply(tree: UnApply, fun: Tree, args: List[Tree])(implicit ctx: PrintingContext) = {
+      p(fun) ++ pp(args, before = "(", separator = ", ", after = ")")
+    }
+
+    override def Match(tree: Match, selector: Tree, cases: List[Tree])(implicit ctx: PrintingContext) = {
+
+      val leadingLayoutForFirstClause = cases match {
+        case first :: _ if first.hasExistingCode =>
+          surroundingLayoutFromParentsAndSiblings(cases.head)._1
+        case _ =>
+          NoLayout
+      }
+
+      val afterSelector = {
+        if (leadingLayoutForFirstClause.asText.startsWith(" "))
+          " match"
+        else
+          " match "
+      }
+
+      val selector_ = p(selector, after = afterSelector)
+
+      val beforeClauses = {
+        if (leadingLayoutForFirstClause.contains("{")) {
+          NoRequisite
+        } else {
+          "{" ++ newlineIndentedToChildren
+        }
+      }
+
+      selector_ ++ ppi(cases, before = beforeClauses, separator = newlineIndentedToChildren, after = indentedNewline ++ "}")
+    }
+  }
+
+  trait MethodCallPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def Select(tree: Select, qualifier: Tree, selector: Name)(implicit ctx: PrintingContext) = {
+      (qualifier, selector) match {
+
+        case (qualifier, nme.CONSTRUCTOR | nme.PACKAGEkw | nme.unapply | nme.unapplySeq) =>
+          p(qualifier)
+
+        case (_: Select | _: Ident | _: Block | _: Literal | _: Apply | _: This | _: Super, _) =>
+          p(qualifier, after = ".") ++ Fragment(escapeScalaKeywordsForImport(tree.nameString))
+
+        case _ =>
+          p(qualifier, before = "(", after = ").") ++ Fragment(tree.nameString)
+      }
+    }
+
+    override def TypeApply(tree: TypeApply, fun: Tree, args: List[Tree])(implicit ctx: PrintingContext) = {
+      fun match {
+
+        case Select(Select(ths: This, selector), _) =>
+          Fragment(selector.toString)
+
+        case _ =>
+          p(fun) ++ pp(args, before = "[", separator = ", ", after = "]")
+      }
+    }
+
+    override def Apply(tree: Apply, fun: Tree, args: List[Tree])(implicit ctx: PrintingContext) = {
+
+      def isOperator(n: Name) = n.isOperatorName && n != nme.CONSTRUCTOR
+
+      (fun, args) match {
+
+        case (fun, args @ (Function(_, _: Match) :: _)) =>
+          p(fun) ++ pp(args, before = " ")
+
+        case (fun: Select, args @ ((arg1: Apply) :: _)) if fun.symbol.isSetter =>
+          p(fun) ++ " = " ++ pp(args)
+
+        case (fun: Select, arg :: Nil) if fun != null && fun.symbol.isSetter =>
+          p(fun) ++ " = " ++ p(arg)
+
+        case (fun: Select, args) if fun.symbol.isSetter =>
+          p(fun) ++ " = " ++ pp(args, before = "(", after = ")", separator = ", ")
+
+        case (fun @ (_: Select | _: Ident), (arg @ Ident(nme.WILDCARD)) :: Nil) =>
+          p(fun) ++ " " ++ p(arg)
+
+        // the empty tree is an implicit parameter, so we mustn't print parenthesis
+        case (fun, List(EmptyTree)) =>
+          p(fun)
+
+        case (Select(selector, op), arg :: Nil) if isOperator(op) =>
+
+          def needsParensAroundArguments(t: Tree) = t match {
+            case global.Apply(Select(_, op2), _) =>
+              isOperator(op2) && precedence(op2) <= precedence(op)
+            case _ => false
+          }
+
+          val select_ = p(selector, after = Requisite.Blank) ++ fun.nameString
+
+          if (needsParensAroundArguments(arg)) {
+            select_ ++ p(arg, before = " (", after = ")")
+          } else {
+            select_ ++ p(arg, before = Requisite.Blank)
+          }
+
+        case (Select(selector, op), arg :: Nil) =>
+          val t = context("ignore") {
+            p(selector).toLayout
+          }
+
+          if (t.withoutComments.endsWith(" "))
+            p(fun) ++ " (" ++ p(arg) ++ ")"
+          else
+            p(fun) ++ "(" ++ p(arg) ++ ")"
+
+        case _ =>
+          val fun_ = p(fun)
+
+          fun_ ++ balanceParens('(', ')') {
+            EmptyFragment ++ "(" ++ pp(args, separator = ", ") ++ ")"
+          }
+      }
+    }
+  }
+
+  trait TypePrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def TypeTree(tree: TypeTree)(implicit ctx: PrintingContext) = {
+      Fragment(typeToString(tree, tree.tpe))
+    }
+
+    override def Typed(tree: Typed, expr: Tree, tpt: Tree)(implicit ctx: PrintingContext): Fragment = {
+      p(expr) ++ p(tpt)
+    }
+
+    override def SingletonTypeTree(tree: SingletonTypeTree, ref: Tree)(implicit ctx: PrintingContext) = {
+      p(ref) ++ Layout(".type")
+    }
+
+    override def CompoundTypeTree(tree: CompoundTypeTree, tpl: Template)(implicit ctx: PrintingContext) = {
+      printTemplate(tpl, false)
+    }
+
+    override def AppliedTypeTree(tree: AppliedTypeTree, tpt: Tree, args: List[Tree])(implicit ctx: PrintingContext) = {
+      p(tpt) ++ pp(args, before = "[", separator = ", ", after = "]")
+    }
+
+    override def TypeBoundsTree(tree: TypeBoundsTree, lo: Tree, hi: Tree)(implicit ctx: PrintingContext) = {
+      p(lo, before = ">: ", after = " ") ++ p(hi, before = "<: ")
+    }
+
+    override def ExistentialTypeTree(tree: ExistentialTypeTree, tpt: Tree, whereClauses: List[Tree])(implicit ctx: PrintingContext) = {
+      whereClauses match {
+        // [_]
+        case (t: TypeDef) :: Nil if t.symbol.isSynthetic =>
+          p(tpt) ++ p(t)
+
+        case _ =>
+          p(tpt) ++ pp(whereClauses, before = " forSome {", after = "}")
+      }
+    }
+
+    override def TypeDef(tree: TypeDef, mods: List[ModifierTree], name: Name, tparams: List[Tree], rhs: Tree)(implicit ctx: PrintingContext) = {
+
+      tree match {
+
+        case t @ global.TypeDef(ModifierTree(Nil), _, Nil, EmptyTree) if t.symbol.isSynthetic =>
+          Fragment("[_]")
+
+        case global.TypeDef(ModifierTree(mods), name, tparams, rhs) =>
+          //mods.annotations map traverse
+          val mods_ = mods map (m => m.nameString + " ") mkString ""
+          val tparams_ = pp(tparams, before = "[", after = "]", separator = ", ")
+          val rhs_ = rhs match {
+            case rhs: TypeTree if rhs.original.isInstanceOf[TypeBoundsTree] =>
+              p(rhs, before = " ")
+            case rhs: TypeBoundsTree =>
+              p(rhs, before = " ")
+            case _ =>
+              p(rhs, before = " = ")
+          }
+          Fragment(mods_ + tree.nameString) ++ tparams_ ++ rhs_
+      }
+    }
+  }
+
+  trait FunctionPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def Function(tree: Function, vparams: List[ValDef], body: Tree)(implicit ctx: PrintingContext) = {
+
+      val (args, bdy) = vparams match {
+
+        case vparam :: Nil if !keepTree(vparam.tpt) =>
+          val _body = p(body)
+
+          if (_body.asText.startsWith("=>") || p(vparam).asText.endsWith("=>")) {
+            (p(vparam) ++ Fragment(" "), _body)
+          } else {
+            (p(vparam, before = "", after = " => "), _body)
+          }
+        case _ =>
+          (pp(vparams, before = "(", separator = ", ", after = ") =>" ++ Requisite.Blank), p(body))
+      }
+
+      body match {
+        // the body of the function contains more than one statement:
+        case Block(_ :: Nil, _) if !bdy.asText.matches("(?ms)\\s*(=>)?\\s*\\{.*") =>
+          Layout("{") ++ args ++ bdy ++ Layout(ctx.newline + ctx.ind.current + "}")
+        case _ =>
+          args ++ bdy
+      }
+    }
+  }
+
+  trait ImportPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def Import(tree: Import, expr: Tree, selectors: List[ImportSelectorTree])(implicit ctx: PrintingContext) = {
+
+      def renames(s: ImportSelector) = s.rename != null && s.name != s.rename
+
+      val needsBraces = selectors.size > 1 || tree.selectors.exists(renames)
+
+      def ss = (tree.selectors map { s =>
+        escapeScalaKeywordsForImport(NameTransformer.decode(s.name.toString)) + {
+          if (renames(s))
+            " => " + escapeScalaKeywordsForImport(NameTransformer.decode(s.rename.toString))
+          else ""
+        }
+      } mkString ", ")
+
+      expr match {
+        case EmptyTree => EmptyFragment
+        case _ if selectors.isEmpty => p(expr)
+        case _ =>
+          val sp = spacingAroundMultipleImports
+          val selectors_ = if (needsBraces) {
+            "{" + sp + ss + sp + "}"
+          } else ss
+
+          // When removing leading package names, sometimes there's a leftover `.` to remove.
+          // We can't remove the `.` in the LayoutHelper because Select printers need them to
+          // handle various special cases.
+          val Cleanup = """^\.?(.*?)\.?\s*\{?\s*$""".r
+
+          val expr_ = p(expr).asText match {
+            case Cleanup(expr) => expr
+          }
+
+          Layout("import ") ++ Fragment(expr_) ++ Requisite.allowSurroundingWhitespace(".") ++ Fragment(selectors_)
+      }
+    }
+  }
+
+  trait PackagePrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def PackageDef(tree: PackageDef, pid: RefTree, stats: List[Tree])(implicit ctx: PrintingContext) = {
+
+      if (pid.name == nme.EMPTY_PACKAGE_NAME) {
+        pp(stats, separator = newline ++ indentedNewline)
+      } else {
+        pp(pid :: stats, before = "package ", separator = newline ++ indentedNewline)
+      }
+    }
+  }
+
+  trait TryThrowPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def Try(tree: Try, block: Tree, catches: List[Tree], finalizer: Tree)(implicit ctx: PrintingContext) = {
+
+      val _block = if (block.isInstanceOf[Block]) {
+        p(block, before = "try ")
+      } else {
+        pi(block, before = "try {" ++ newlineIndentedToChildren, after = indentedNewline ++ "}")
+      }
+
+      val _catches = ppi(catches, before = " catch {" ++ newlineIndentedToChildren, separator = newlineIndentedToChildren, after = indentedNewline ++ "}")
+
+      val _finalizer = finalizer match {
+        case EmptyTree => EmptyFragment
+        case block: Block => p(block, before = " finally ")
+        case _ =>
+          pi(finalizer, before = " finally {" ++ newlineIndentedToChildren, after = indentedNewline ++ "}")
+      }
+
+      _block ++ _catches ++ _finalizer
+      //XXX create a "printBlock"
+    }
+
+    override def Throw(tree: Throw, expr: Tree)(implicit ctx: PrintingContext) = {
+      Layout("throw ") ++ p(expr)
+    }
+  }
+
+  trait ClassModulePrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def ClassDef(tree: ClassDef, mods: List[ModifierTree], name: Name, tparams: List[Tree], impl: Template)(implicit ctx: PrintingContext) = {
+
+      //mods.annotations map traverse
+      val mods_ = mods map (m => m.nameString + " ") mkString ""
+
+      val keyword = if (tree.mods.isTrait)
+        "" // "trait" is a modifier
+      else
+        "class "
+
+      val body = impl match {
+        case TemplateExtractor(Nil :: Nil, _, _, _, _) if mods exists (_.nameString == "case") =>
+          Layout("()") ++ p(impl)
+        case _ =>
+          p(impl)
+      }
+
+      Fragment(mods_ + keyword + name) ++ pp(tparams, before = "[", separator = ", ", after = "]") ++ body.ifNotEmpty {
+        case body if body.asText.startsWith("{") =>
+          Layout(" ") ++ body
+        case body =>
+          body
+      }
+    }
+
+    override def ModuleDef(tree: ModuleDef, mods: List[ModifierTree], name: Name, impl: Template)(implicit ctx: PrintingContext) = {
+      //        mods.annotations map traverse
+
+      val mods_ = mods map (m => m.nameString + " ") mkString ""
+      Fragment(mods_ + "object " + name) ++ p(impl)
+    }
+
+    override def Template(tree: Template, parents: List[Tree], self: Tree, body: List[Tree])(implicit ctx: PrintingContext) = {
+      printTemplate(tree, printExtends = true)
+    }
+  }
+
+  trait IfPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def If(tree: If, cond: Tree, thenp: Tree, elsep: Tree)(implicit ctx: PrintingContext) = {
+
+      val (thenLeadingLayout_, then_) = {
+        pi(thenp) match {
+          case f => (f.leading, f.dropLeadingLayout)
+        }
+      }
+
+      val cond_ = balanceParens('(', ')') {
+        p(cond, before = "if (", after = ")") ++ thenLeadingLayout_ ++ Requisite.Blank
+      }
+
+      val beforeElse = {
+        if (thenLeadingLayout_.contains("{"))
+          indentedNewline ++ "} else "
+        else
+          allowSurroundingWhitespace(" else ")
+      }
+
+      val else_ = p(elsep, before = beforeElse)
+
+      cond_ ++ then_ ++ else_
+    }
+  }
+
+  trait ValDefDefPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def ValDef(tree: ValDef, mods: List[ModifierTree], name: Name, tpt: Tree, rhs: Tree)(implicit ctx: PrintingContext) = {
+
+      def needsKeyword(t: ValDef) =
+        !t.mods.hasFlag(Flags.PARAM) &&
+          !t.mods.hasFlag(Flags.PARAMACCESSOR) &&
+          !t.mods.hasFlag(Flags.CASEACCESSOR) &&
+          !t.mods.hasFlag(Flags.SYNTHETIC) &&
+          !t.symbol.isSynthetic
+
+      //mods.annotations map traverse
+      val mods_ = {
+        val existingMods = mods map (m => m.nameString + " ") mkString ""
+        if (!tree.symbol.isMutable && needsKeyword(tree) && !existingMods.contains("val")) {
+          existingMods + "val "
+        } else {
+          existingMods
+        }
+      }
+
+      val valName = if (tree.symbol.isThisSym && name.toString == "_") { // this: ... =>
+        "this"
+      } else {
+        name.toString.trim
+      }
+
+      val rhs_ = p(rhs, before = " = ")
+
+      val RhsOnNewLine = "(?ms)\\s*(?:= )?\r?\n\\s*(.*)".r
+
+      val rhsWithNewlineFix = rhs_.leading.asText match {
+        case RhsOnNewLine(withoutLeadingSpace) => Layout(" = ") ++ withoutLeadingSpace ++ rhs_.dropLeadingLayout
+        case _ => rhs_
+      }
+
+      Fragment(mods_ + valName) ++ p(tpt, before = ": ") ++ rhsWithNewlineFix
+    }
+
+    override def DefDef(tree: DefDef, mods: List[ModifierTree], name: Name, tparams: List[Tree], vparamss: List[List[ValDef]], tpt: Tree, rhs: Tree)(implicit ctx: PrintingContext) = {
+      //mods.annotations map traverse
+
+      val mods_ = {
+        val existingMods = mods map (m => m.nameString + " ") mkString ""
+        if (tree.mods.hasFlag(Flags.STABLE) && !existingMods.contains("val")) {
+          existingMods + "val "
+        } else {
+          existingMods
+        }
+      }
+
+      val tparams_ = {
+        // Finalize this fragment so that the anywhere-requisite gets applied here
+        // and does not match on ] that might come later (see testNewDefDefWithOriginalContent3
+        // and testDefDefWithTypeParams).
+        pp(tparams, before = "[", after = anywhere("]"), separator = ", ").toLayout
+      }
+
+      // if there's existing layout, the type parameter's layout might already contain "()"
+      val params_ = printParameterList(vparamss, tparams_.asText)
+
+      val rhs = if (tree.rhs == EmptyTree && !tree.symbol.isDeferred) {
+        Fragment(" {" + ctx.newline + ctx.ind.current + "}")
+      } else {
+        p(tree.rhs, before = Requisite.allowSurroundingWhitespace("=", " = "))
+      }
+
+      val resultType = {
+        // The `:` has many places where it can hide, not just the adjoining layout,
+        // so we have to check several places: if the parameter list is empty, it could
+        // even be part of the tparams.
+        val colon = new Requisite {
+          def isRequired(l: Layout, r: Layout) = {
+            !(l.contains(":") || r.contains(":") || {
+              (tparams_.withoutComments + params_.withoutComments).matches(".*:\\s*")
+            })
+          }
+          def getLayout = Layout(": ")
+        }
+        // Finalize the layout so the `:` won't be searched in the rhs.
+        p(tpt, before = colon).toLayout
+      }
+
+      Fragment(mods_ + tree.nameString) ++ tparams_ ++ params_ ++ resultType ++ rhs
+    }
+  }
+
+  trait SuperPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def SuperConstructorCall(tree: SuperConstructorCall, clazz: global.Tree, args: List[global.Tree])(implicit ctx: PrintingContext) = {
+      p(clazz) ++ pp(args, before = "(", separator = ", ", after = ")")
+    }
+
+    override def Super(tree: Super, qual: Tree, mix: Name)(implicit ctx: PrintingContext) = {
+
+      val q = qual match {
+        case This(qual: Name) if qual.toString == "" => EmptyFragment
+        case This(qual: Name) => Fragment(qual.toString + ".")
+        case _ => p(qual) // can this actually happen?
+      }
+
+      val m = if (mix.toString == "") "" else "[" + mix + "]"
+
+      q ++ Fragment("super" + m)
+    }
+  }
+
+  trait LiteralPrinters {
+    this: TreePrinting with PrintingUtils =>
+    override def Literal(tree: Literal, value: Constant)(implicit ctx: PrintingContext) = {
+
+      if (value.tag == StringTag) {
+        Fragment(value.escapedStringValue)
+      } else if (value.isNumeric) {
+        val suffix = value.tag match {
+          case FloatTag => "f"
+          case LongTag => "l"
+          case _ => ""
+        }
+        Fragment(value.stringValue + suffix)
+      } else {
+        Fragment(value.stringValue)
+      }
+    }
+  }
+
+  trait BlockPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def Block(tree: Block, stats: List[Tree])(implicit ctx: PrintingContext) = {
+
+      def printWithEnclosing = ppi(stats, before = "{" ++ newlineIndentedToChildren, separator = newlineIndentedToChildren, after = indentedNewline ++ "}")
+
+      // FIXME don't code when tired..
+
+      if (stats.size > 1 && !stats.head.hasExistingCode && stats.tail.exists(_.hasExistingCode)) {
+
+        val firstWithExistingCode = stats.find(_.hasExistingCode).get
+        val printed = pi(firstWithExistingCode)
+        if (printed.leading.matches("(?ms).*\\{.*")) {
+
+          val ExtractOpeningBrace = new scala.util.matching.Regex("(?ms)(.*\\{.*?)(\r?\n.*)")
+          val ExtractOpeningBrace(leading, rest) = printed.leading.asText
+
+          val printedStats = stats map {
+            case tree if tree == firstWithExistingCode =>
+              Fragment(Layout(rest), printed.center, printed.trailing)
+            case tree =>
+              pi(tree)
+          }
+
+          Layout(leading) ++ newlineIndentedToChildren ++ printedStats.foldLeft(EmptyFragment: Fragment)(_ ++ _)
+
+        } else {
+          printWithEnclosing
+        }
+      } else if (stats.head.hasExistingCode) {
+
+        val printed = context("temp print") {
+          p(stats.head)
+        }
+
+        if (printed.leading.matches("(?ms).*\\{.*")) {
+          ppi(stats, separator = newlineIndentedToChildren, after = indentedNewline ++ "}")
+        } else {
+          printWithEnclosing.dropLeadingIndentation
+        }
+      } else {
+        printWithEnclosing
+      }
+    }
+  }
+
+  trait MiscPrinters {
+    this: TreePrinting with PrintingUtils =>
+
+    override def DocDef(tree: DocDef, comment: DocComment, definition: Tree)(implicit ctx: PrintingContext) = {
+      ctx.ind.fixIndentation(comment.raw, "") ++ p(definition)
+    }
+
+    override def Assign(tree: Assign, lhs: Tree, rhs: Tree)(implicit ctx: PrintingContext) = {
+      p(lhs) ++ " = " ++ p(rhs)
+    }
+
+    override def Return(tree: Return, expr: Tree)(implicit ctx: PrintingContext) = {
+      Layout("return ") ++ p(expr)
+    }
+
+    override def New(tree: New, tpt: Tree)(implicit ctx: PrintingContext) = {
+      Layout("new ") ++ p(tpt)
+    }
+
+    override def This(tree: This, qual: Name)(implicit ctx: PrintingContext) = {
+      Fragment((if (qual.toString == "") "" else qual.toString + ".") + "this")
+    }
+
+    override def Ident(tree: Ident, name: Name)(implicit ctx: PrintingContext) = {
+      if (tree.symbol.isSynthetic && name.toString.contains("$"))
+        Fragment("_")
+      // Some identifiers start with an unnecessary <root> ident:
+      else if (tree.symbol.nameString == "<root>")
+        EmptyFragment
+      else
+        Fragment(name.toString)
+    }
+
+    override def ModifierTree(tree: ModifierTree, flag: Long)(implicit ctx: PrintingContext) = {
+      Fragment(tree.nameString)
+    }
+
+    override def MultipleAssignment(tree: MultipleAssignment, extractor: Tree, values: List[ValDef], rhs: Tree)(implicit ctx: PrintingContext): Fragment = {
+      extractor match {
+        case EmptyTree =>
+          Layout("val (") ++ pp(values, separator = ", ", after = ")") ++ " = " ++ p(rhs)
+        case _ =>
+          Layout("val ") ++ p(extractor) ++ " = " ++ p(rhs)
+      }
+    }
+
+    override def NameTree(tree: Tree)(implicit ctx: PrintingContext) = {
+      if (tree.pos.isTransparent) {
+        EmptyFragment
+      } else {
+        Fragment(tree.nameString)
+      }
+    }
+
+    override def SourceLayoutTree(tree: SourceLayoutTree)(implicit ctx: PrintingContext) = {
+      tree.kind match {
+        case SourceLayouts.Newline =>
+          Fragment(ctx.newline + ctx.newline + ctx.ind.current)
+      }
+    }
+  }
+}
+
+/*
+ * Copyright 2005-2010 LAMP/EPFL
+ */
+
+package scala.tools.refactoring
+package tests.implementations
+
+import implementations.Rename
+import tests.util.TestRefactoring
+import tests.util.TestHelper
+import org.junit.Assert._
+import org.junit.Ignore
+import language.reflectiveCalls
+import scala.language.existentials
+import scala.tools.refactoring.common.Change
+import TestHelper.PrepResultWithChanges
+import scala.tools.refactoring.common.TracingImpl
+
+class RenameTest extends TestHelper with TestRefactoring {
+  outer =>
+
+  private def prepareAndRenameTo(name: String)(pro: FileSet): PrepResultWithChanges = {
+    val impl = new TestRefactoringImpl(pro) {
+      val refactoring = new Rename with TracingImpl with TestProjectIndex
+    }
+    PrepResultWithChanges(Some(impl.preparationResult()), impl.performRefactoring(name))
+  }
+
+  private def renameTo(name: String)(pro: FileSet): List[Change] = {
+    prepareAndRenameTo(name)(pro).changes
+  }
+
+  @Test
+  def renameOverlapping() = new FileSet {
+    """
+      package renameOverlapping
+
+      case class /*(*/Die/*)*/(top: Int, right: Int, front: Int) {
+        import Transform._
+
+        def transform(how: Boolean) = how match {
+          case true => Die(front, right, top)
+          case false => Die(front, right, top)
+        }
+      }
+      object Transform
+    """ becomes
+    """
+      package renameOverlapping
+
+      case class /*(*/Dice/*)*/(top: Int, right: Int, front: Int) {
+        import Transform._
+
+        def transform(how: Boolean) = how match {
+          case true => Dice(front, right, top)
+          case false => Dice(front, right, top)
+        }
+      }
+      object Transform
+    """
+  } applyRefactoring(renameTo("Dice"))
+
+  @Test
+  def renameRecursive() = new FileSet {
+    """
+      package renameRecursive
+      class A {
+        def length[T](l: List[T]): Int = l match {
+          case Nil => 0
+          case x :: xs => 1 +  /*(*/  length(xs)  /*)*/
+        }
+      }
+    """ becomes
+    """
+      package renameRecursive
+      class A {
+        def recursiveLength[T](l: List[T]): Int = l match {
+          case Nil => 0
+          case x :: xs => 1 +  /*(*/  recursiveLength(xs)  /*)*/
+        }
+      }
+    """
+  } applyRefactoring(renameTo("recursiveLength"))
+
+  @Test
+  def renameLocalValue() = new FileSet {
+    """
+      package renameLocal1
+      class A {
+        def double(s: String) = s + s
+        def extractFrom {
+          val s = "hallo"
+  /*(*/   s   /*)*/ .length
+          double(s + "a")
+        }
+      }
+    """ becomes
+    """
+      package renameLocal1
+      class A {
+        def double(s: String) = s + s
+        def extractFrom {
+          val b = "hallo"
+  /*(*/   b   /*)*/ .length
+          double(b + "a")
+        }
+      }
+    """
+  } applyRefactoring(renameTo("b"))
+
+  @Test
+  def renameLazyVal() = new FileSet {
+    """
+    package renameLazyVal
+    class A {
+      def rename() {
+        lazy val a = 5
+        println(/*(*/a/*)*/)
+      }
+    }
+    """ becomes
+    """
+    package renameLazyVal
+    class A {
+      def rename() {
+        lazy val b = 5
+        println(/*(*/b/*)*/)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("b"))
+
+  @Test
+  def renameLazyValFromDefinition() = new FileSet {
+    """
+    package renameLazyVals
+    class A {
+      def print {
+        lazy val /*(*/a = 42/*)*/
+        println(a)
+      }
+    }
+    """ becomes
+    """
+    package renameLazyVals
+    class A {
+      def print {
+        lazy val /*(*/c = 42/*)*/
+        println(c)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("c"))
+
+  /*
+   * See Assembla ticket #1002392
+   */
+  @Test
+  def renameLazyValFromClass() = new FileSet {
+    """
+    package renameLazyValFromClass
+    class Bug {
+      lazy val /*(*/tryRenameMe/*)*/ = "bar"
+    }
+    """ becomes
+    """
+    package renameLazyValFromClass
+    class Bug {
+      lazy val /*(*/test/*)*/ = "bar"
+    }
+    """
+  } applyRefactoring(renameTo("test"))
+
+  /*
+   * See Assembla ticket #1002392
+   */
+  @Test
+  def renameProtectedLazyValFromClass() = new FileSet {
+    """
+    package renameLazyValFromClass
+    class Bug {
+      protected lazy val /*(*/tryRenameMe/*)*/ = "bar"
+    }
+    """ becomes
+    """
+    package renameLazyValFromClass
+    class Bug {
+      protected lazy val /*(*/test/*)*/ = "bar"
+    }
+    """
+  } applyRefactoring(renameTo("test"))
+
+  /*
+   * See Assembla ticket #1002392
+   */
+  @Test
+  def renameLazyValFromClassWithOneLetterName() = new FileSet {
+    """
+    package renameLazyValFromClass
+    class Bug {
+      lazy val /*(*/x/*)*/ = "bar"
+    }
+    """ becomes
+    """
+    package renameLazyValFromClass
+    class Bug {
+      lazy val /*(*/y/*)*/ = "bar"
+    }
+    """
+  } applyRefactoring(renameTo("y"))
+
+  @Test
+  def renameParameterWithoutSelection() = new FileSet {
+    """
+    package renameParameter
+    class A {
+      def rename(a/*<-*/: String) {
+        println(a)
+      }
+    }
+    """ becomes
+    """
+    package renameParameter
+    class A {
+      def rename(b/*<-*/: String) {
+        println(b)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("b"))
+
+  @Test
+  def renameParameter() = new FileSet {
+    """
+    package renameParameter
+    class A {
+      def rename(  /*(*/a/*)*/  : String) {
+        println(a)
+      }
+    }
+    """ becomes
+    """
+    package renameParameter
+    class A {
+      def rename(  /*(*/b/*)*/  : String) {
+        println(b)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("b"))
+
+  @Test
+  def renameWithType() = new FileSet {
+    """
+    package renameWithType
+    class A {
+      def rename(a: String) {
+        a match {
+          case b: String => /*(*/  b  /*)*/
+        }
+      }
+    }
+    """ becomes
+    """
+    package renameWithType
+    class A {
+      def rename(a: String) {
+        a match {
+          case c: String => /*(*/  c  /*)*/
+        }
+      }
+    }
+    """
+  } applyRefactoring(renameTo("c"))
+
+  @Test
+  def renameMultiAssignment() = new FileSet {
+    """
+    package renameMultiAssignment
+    class A {
+      def print {
+        val (/*(*/a/*)*/, b) = (5, 6)
+        println(a + b)
+      }
+    }
+    """ becomes
+    """
+    package renameMultiAssignment
+    class A {
+      def print {
+        val (/*(*/c/*)*/, b) = (5, 6)
+        println(c + b)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("c"))
+
+  @Test
+  def renameMultiAssignmentWithTA() = new FileSet {
+    """
+    package renameMultiAssignment
+    class A {
+      def print {
+        val (/*(*/a: Int/*)*/, b) = (5, 6)
+        println(a + b)
+      }
+    }
+    """ becomes
+    """
+    package renameMultiAssignment
+    class A {
+      def print {
+        val (/*(*/c: Int/*)*/, b) = (5, 6)
+        println(c + b)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("c"))
+
+  @Test
+  def renameClassWithTypeParameters() = new FileSet {
+    """
+    case class /*(*/Test/*)*/[A, B](a:A,b:B)
+    """ becomes
+    """
+    case class /*(*/Test1/*)*/[A, B](a:A,b:B)
+    """
+  } applyRefactoring(renameTo("Test1"))
+
+  @Test
+  def renameAbstractType() = new FileSet {
+    """
+    trait O {
+      trait Property[+T]
+      type /*(*/Prop_Tp/*)*/[+Vl_Tpe] <: Property[Vl_Tpe]
+      def properties: Set[Prop_Tp[_]] = null.asInstanceOf[Set[Prop_Tp[_]]]
+    }
+    """ becomes
+    """
+    trait O {
+      trait Property[+T]
+      type /*(*/Prop_Tpe/*)*/[+Vl_Tpe] <: Property[Vl_Tpe]
+      def properties: Set[Prop_Tpe[_]] = null.asInstanceOf[Set[Prop_Tpe[_]]]
+    }
+    """
+  } applyRefactoring(renameTo("Prop_Tpe"))
+
+  @Test
+  def renameReferenceToOuterclass() = new FileSet {
+    """
+    package renameReferenceToOuterclass
+    class /*(*/Foo/*)*/ {
+      class Bar {
+        def foo = Foo.this
+      }
+    }
+    """ becomes
+    """
+    package renameReferenceToOuterclass
+    class /*(*/Blubb/*)*/ {
+      class Bar {
+        def foo = Blubb.this
+      }
+    }
+    """
+  } applyRefactoring(renameTo("Blubb"))
+
+  @Test
+  def renameDeconstructingAssignment() = new FileSet {
+    """
+    package renameMultiAssignment
+    class A {
+      def print {
+        val List(/*(*/a/*)*/, b) = List(5, 6)
+        println(a + b)
+      }
+    }
+    """ becomes
+    """
+    package renameMultiAssignment
+    class A {
+      def print {
+        val List(/*(*/c/*)*/, b) = List(5, 6)
+        println(c + b)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("c"))
+
+  @Test
+  def renameBinding() = new FileSet {
+    """
+    package renameBinding
+    class A {
+      def print {
+        1 match { case /*(*/ i /*)*/ => i }
+      }
+    }
+    """ becomes
+    """
+    package renameBinding
+    class A {
+      def print {
+        1 match { case /*(*/ integer /*)*/ => integer }
+      }
+    }
+    """
+  } applyRefactoring(renameTo("integer"))
+
+  @Test
+  def renameNewVal() = new FileSet {
+    """
+    package renameNewVal
+    class A(i: Int) {
+      def print {
+        var  /*(*/  l = /*)*/  new A(5)
+      }
+    }
+    """ becomes
+    """
+    package renameNewVal
+    class A(i: Int) {
+      def print {
+        var  /*(*/  ls = /*)*/  new A(5)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("ls"))
+
+  @Test
+  def renameLazyArg() = new FileSet {
+    """
+    package renameLazyArg
+    class A(i: Int) {
+      def print(a: => String) {
+        println(/*(*/  a  /*)*/)
+      }
+    }
+    """ becomes
+    """
+    package renameLazyArg
+    class A(i: Int) {
+      def print(s: => String) {
+        println(/*(*/  s  /*)*/)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("s"))
+
+  @Test
+  def forComprehension() = new FileSet {
+    """
+    package forComprehension
+    class A {
+      def print {
+        for(  /*(*/  i  /*)*/  <- 1 to 10) yield i
+      }
+    }
+    """ becomes
+    """
+    package forComprehension
+    class A {
+      def print {
+        for(  /*(*/  index  /*)*/  <- 1 to 10) yield index
+      }
+    }
+    """
+  } applyRefactoring(renameTo("index"))
+
+  @Test
+  def inConstructor() = new FileSet {
+    """
+    package inConstructor
+    class A(i: Int) {
+      val /*(*/  y  /*)*/ = i * 2
+    }
+    """ becomes
+    """
+    package inConstructor
+    class A(i: Int) {
+      val /*(*/  iTimesTwo  /*)*/ = i * 2
+    }
+    """
+  } applyRefactoring(renameTo("iTimesTwo"))
+
+  @Test
+  def renameMethod() = new FileSet {
+    """
+    package renameMethod
+    class A {
+      def get(a: Int) = "get"
+      def main = {
+        val a = /*(*/  get  /*)*/  (5)
+      }
+    }
+
+    class B(a: A) {
+      val x = a.get(10)
+    }
+    """ becomes
+    """
+    package renameMethod
+    class A {
+      def x(a: Int) = "get"
+      def main = {
+        val a = /*(*/  x  /*)*/  (5)
+      }
+    }
+
+    class B(a: A) {
+      val x = a.x(10)
+    }
+    """
+  } applyRefactoring(renameTo("x"))
+
+  @Test
+  def renameMethodInMultipleFiles() = new FileSet {
+    """
+    package rename
+    class A {
+      /*(*/  def get(a: Int) = "get"  /*)*/
+    }
+    """ becomes
+    """
+    package rename
+    class A {
+      /*(*/  def x(a: Int) = "get"  /*)*/
+    }
+    """
+    ;
+    """
+    package rename
+    class B {
+      val a = new A
+      val get = a.get(5)
+    }
+    """ becomes
+    """
+    package rename
+    class B {
+      val a = new A
+      val get = a.x(5)
+    }
+    """
+  } applyRefactoring(renameTo("x"))
+
+  @Test
+  def renameClass() = new FileSet {
+    """
+    package renameClass
+    /*(*/  class A  /*)*/
+
+    class B extends A
+    """ becomes
+    """
+    package renameClass
+    /*(*/  class X  /*)*/
+
+    class B extends X
+    """
+    ;
+    """
+    package renameClass
+    object C extends A {
+      val a = new A
+      val as = new collection.mutable.ListBuffer[A]
+      def doWithA(a: A) = new A
+    }
+    """ becomes
+    """
+    package renameClass
+    object C extends X {
+      val a = new X
+      val as = new collection.mutable.ListBuffer[X]
+      def doWithA(a: X) = new X
+    }
+    """
+  } applyRefactoring(renameTo("X"))
+
+  @Test
+  def renameTypeParameter() = new FileSet {
+    """
+    package ex
+
+    trait Monad[ /*(*/M/*)*/[_]] {
+      def flatMap[A, B](a: M[A], f: A => M[B]): M[B]
+      def unital[A](a: A): M[A]
+    }
+    """ becomes
+    """
+    package ex
+
+    trait Monad[ /*(*/Md/*)*/[_]] {
+      def flatMap[A, B](a: Md[A], f: A => Md[B]): Md[B]
+      def unital[A](a: A): Md[A]
+    }
+    """
+  } applyRefactoring(renameTo("Md"))
+
+  @Test
+  def renameSuperClass() = new FileSet {
+    """
+    package ex
+
+    sealed abstract class /*(*/Term/*)*/
+
+    case object TmTrue extends Term
+    case class  TmIf(t1: Term, t2: Term, t3: Term) extends Term
+    """ becomes
+    """
+    package ex
+
+    sealed abstract class /*(*/Expr/*)*/
+
+    case object TmTrue extends Expr
+    case class  TmIf(t1: Expr, t2: Expr, t3: Expr) extends Expr
+    """
+  } applyRefactoring(renameTo("Expr"))
+
+  @Test
+  def renameType() = new FileSet {
+    """
+
+    class Person(name: String)
+
+    object Rename1 {
+      class /*(*/Person/*)*/(name: String)
+
+      def main(args: Array[String]) {
+
+        val people: List[Person] = List(new Person("Mirko"), new Person("Christina"))
+
+      }
+    }""" becomes
+    """
+
+    class Person(name: String)
+
+    object Rename1 {
+      class /*(*/P/*)*/(name: String)
+
+      def main(args: Array[String]) {
+
+        val people: List[P] = List(new P("Mirko"), new P("Christina"))
+
+      }
+    }"""
+  } applyRefactoring(renameTo("P"))
+
+  @Test
+  def renameCaseClass() = new FileSet {
+    """
+    case class /*(*/Person/*)*/(name: String)
+
+    object Rename1 {
+      val p = Person("Mirko")
+    }""" becomes
+    """
+    case class /*(*/P/*)*/(name: String)
+
+    object Rename1 {
+      val p = P("Mirko")
+    }"""
+  } applyRefactoring(renameTo("P"))
+
+  @Test
+  def renameSelfType() = new FileSet {
+    """
+    trait /*(*/T1/*)*/
+
+    trait T3 {
+      self: T1 =>
+
+    }""" becomes
+    """
+    trait /*(*/Trait/*)*/
+
+    trait T3 {
+      self: Trait =>
+
+    }"""
+  } applyRefactoring renameTo("Trait")
+
+  @Test
+  def renameSelfType2() = new FileSet {
+    """
+    trait /*(*/T1/*)*/
+    trait T2
+
+    trait T3 {
+      self: T1 with T2 =>
+
+    }""" becomes
+    """
+    trait /*(*/Trait/*)*/
+    trait T2
+
+    trait T3 {
+      self: Trait with T2 =>
+
+    }"""
+  } applyRefactoring(renameTo("Trait"))
+
+  @Test
+  def renameClassWithImport() = new FileSet {
+    """
+    package withTrait
+    trait /*(*/T/*)*/
+    """ becomes
+    """
+    package withTrait
+    trait /*(*/Trait/*)*/
+    """
+    ;
+    """
+    package withoutTrait
+    import withTrait.T
+    trait TSub extends T
+    """ becomes
+    """
+    package withoutTrait
+    import withTrait.Trait
+    trait TSub extends Trait
+    """
+  } applyRefactoring(renameTo("Trait"))
+
+  @Test
+  def renamePackages() = new FileSet {
+    """
+    package /*(*/p1/*)*/
+    """ becomes
+    """
+    package /*(*/refactoring/*)*/
+    """
+    ;
+    """
+    package p1.p2
+    import  p1._
+    """ becomes
+    """
+    package refactoring.p2
+    import  refactoring._
+    """
+  } applyRefactoring(renameTo("refactoring"))
+
+  @Test
+  def renameInnerPackages() = new FileSet {
+    """
+    package p1
+    package /*(*/   p2  /*)*/ {
+      package p3 {
+        class A
+      }
+    }
+    """ becomes
+    """
+    package p1
+    package /*(*/   refactoring  /*)*/ {
+      package p3 {
+        class A
+      }
+    }
+    """
+    ;
+    """
+    package p1
+    class B extends  p2.p3.A
+    """ becomes
+    """
+    package p1
+    class B extends  refactoring.p3.A
+    """
+  } applyRefactoring(renameTo("refactoring"))
+
+  @Test
+  def renameUnderWindows() = new FileSet {
+    "package com.test\r\nobject Hello {\r\n  def test = {\r\n    val /*(*/loc/*)*/ = 42\r\n    loc * loc\r\n  }\r\n}" becomes
+    "package com.test\r\nobject Hello {\r\n  def test = {\r\n    val /*(*/fourtytwo/*)*/ = 42\r\n    fourtytwo * fourtytwo\r\n  }\r\n}"
+  } applyRefactoring(renameTo("fourtytwo"))
+
+
+  @Test
+  def renameCaseClassAndObject() = new FileSet {
+    """
+      object /*(*/TestIde/*)*/ {}
+
+      case class TestIde {}
+    """ becomes
+    """
+      object /*(*/TestIde1/*)*/ {}
+
+      case class TestIde1 {}
+    """
+  } applyRefactoring(renameTo("TestIde1"))
+
+  @Test
+  def renameNestedType() = new FileSet {
+    """
+    trait /*(*/Thing/*)*/ {
+      val otherThings: Set[Thing] = Set()
+      val myThing: Thing
+    }
+    """ becomes
+    """
+    trait /*(*/X/*)*/ {
+      val otherThings: Set[X] = Set()
+      val myThing: X
+    }
+    """
+  } applyRefactoring(renameTo("X"))
+
+  @Test
+  def renameIdentifierWithBackticks() = new FileSet {
+    """
+    trait StrangeIdentifiers {
+      val /*(*/`my strange identifier`/*)*/ = "foo"
+      val `my strange identifier 2` = `my strange identifier`
+    }
+    """ becomes
+    """
+    trait StrangeIdentifiers {
+      val /*(*/`my strange identifier again`/*)*/ = "foo"
+      val `my strange identifier 2` = `my strange identifier again`
+    }
+    """
+  } applyRefactoring(renameTo("`my strange identifier again`"))
+
+  @Test
+  def renameClassWithBackTicks() = new FileSet {
+    """
+    package renameClassWithBackTicks
+    /*(*/
+    class `A` {
+      val a = new `A`
+    } /*)*/
+    """ becomes
+    """
+    package renameClassWithBackTicks
+    /*(*/
+    class `X Y` {
+      val a = new `X Y`
+    } /*)*/
+    """
+  } applyRefactoring(renameTo("`X Y`"))
+
+  @Test
+  def renameTypeParamInSecondConstructor() = new FileSet {
+    """
+    trait /*(*/X/*)*/
+
+    class StrangeIdentifiers () {
+      def this(comparator: java.util.Comparator[X]) = {
+        this()
+      }
+    }
+    """ becomes
+    """
+    trait /*(*/Comp/*)*/
+
+    class StrangeIdentifiers () {
+      def this(comparator: java.util.Comparator[Comp]) = {
+        this()
+      }
+    }
+    """
+  } applyRefactoring(renameTo("Comp"))
+
+  @Test
+  def renameSingleVariableDeconstructingAssignment() = new FileSet {
+    """
+    package renameSingleVariableDeconstructingAssignment
+    class A {
+      def print {
+        val List(/*(*/a/*)*/, _) = List(5, 6)
+        println(a)
+      }
+    }
+    """ becomes
+    """
+    package renameSingleVariableDeconstructingAssignment
+    class A {
+      def print {
+        val List(/*(*/c/*)*/, _) = List(5, 6)
+        println(c)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("c"))
+
+  @Test
+  def renameSingleVariableDeconstructingAssignment2() = new FileSet {
+    """
+    package renameSingleVariableDeconstructingAssignment2
+    class A {
+      def print {
+        val Some(/*(*/a/*)*/) = Some(6)
+        println(a)
+      }
+    }
+    """ becomes
+    """
+    package renameSingleVariableDeconstructingAssignment2
+    class A {
+      def print {
+        val Some(/*(*/c/*)*/) = Some(6)
+        println(c)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("c"))
+
+  @Test
+  def renameSingleVariableDeconstructingAssignment3() = new FileSet {
+    """
+    package renameSingleVariableDeconstructingAssignment2
+    class A {
+      def print {
+        val Reg = "(\\w)".r
+        val Reg(/*(*/a/*)*/) = "x"
+        println(a)
+      }
+    }
+    """ becomes
+    """
+    package renameSingleVariableDeconstructingAssignment2
+    class A {
+      def print {
+        val Reg = "(\\w)".r
+        val Reg(/*(*/c/*)*/) = "x"
+        println(c)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("c"))
+
+  @Test
+  def renameSingleVariableDeconstructingAssignment4() = new FileSet {
+    """
+    package renameSingleVariableDeconstructingAssignment4
+    class A {
+      def print {
+        val List(_, /*(*/a/*)*/) = List(1, 2)
+        println(a)
+      }
+    }
+    """ becomes
+    """
+    package renameSingleVariableDeconstructingAssignment4
+    class A {
+      def print {
+        val List(_, /*(*/c/*)*/) = List(1, 2)
+        println(c)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("c"))
+
+  @Test
+  def renameSingleVariableDeconstructingAssignment5() = new FileSet {
+    """
+    package renameSingleVariableDeconstructingAssignment5
+    class A {
+      def print {
+        val List(_, Some(List(_, Some(/*(*/a/*)*/), _))) = List(None, Some(List(1, Some(2), 3)))
+        println(a)
+      }
+    }
+    """ becomes
+    """
+    package renameSingleVariableDeconstructingAssignment5
+    class A {
+      def print {
+        val List(_, Some(List(_, Some(/*(*/c/*)*/), _))) = List(None, Some(List(1, Some(2), 3)))
+        println(c)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("c"))
+
+  @Test
+  def renameSingleVariableDeconstructingAssignment6() = new FileSet {
+    """
+    package renameSingleVariableDeconstructingAssignment6
+    class A {
+      def print {
+        val List(/*(*/a/*)*/: Int) = List(42)
+        println(a)
+      }
+    }
+    """ becomes
+    """
+    package renameSingleVariableDeconstructingAssignment6
+    class A {
+      def print {
+        val List(/*(*/c/*)*/: Int) = List(42)
+        println(c)
+      }
+    }
+    """
+  } applyRefactoring(renameTo("c"))
+
+
+  @Test
+  def renameClassParameterPassedIntoSuperClassWithExpression() = new FileSet {
+    """
+    class Class(/*(*/a/*)*/: String) extends RuntimeException(a + "")
+    """ becomes
+    """
+    class Class(/*(*/b/*)*/: String) extends RuntimeException(b + "")
+    """
+  } applyRefactoring(renameTo("b"))
+
+  @Test
+  def renameClassParameterPassedIntoSuperClassWithExpression2() = new FileSet {
+    """
+    package renameClassParameterPassedIntoSuperClassWithExpression2
+    class Class(val /*(*/a/*)*/: String) extends RuntimeException(a + "")
+    """ becomes
+    """
+    package renameClassParameterPassedIntoSuperClassWithExpression2
+    class Class(val /*(*/b/*)*/: String) extends RuntimeException(b + "")
+    """
+  } applyRefactoring(renameTo("b"))
+
+  @Test
+  def renameSuperclassAtEndOfFile() = new FileSet {
+    """
+    package renameSuperclassAtEndOfFile
+    class /*(*/Bar/*)*/
+    class Foo extends Bar""" becomes
+    """
+    package renameSuperclassAtEndOfFile
+    class /*(*/Baz/*)*/
+    class Foo extends Baz"""
+  } applyRefactoring(renameTo("Baz"))
+
+  @Test
+  def renameSuperclassAtEndOfFile2() = new FileSet {
+    """
+    package renameSuperclassAtEndOfFile
+    class B
+    class /*(*/A/*)*/ extends B""" becomes
+    """
+    package renameSuperclassAtEndOfFile
+    class B
+    class /*(*/Bazadudud/*)*/ extends B"""
+  } applyRefactoring(renameTo("Bazadudud"))
+
+  @Test
+  def renameMethodInCaseObject() = new FileSet {
+    """
+  abstract class Base {
+    def /*(*/foo/*)*/ = false
+  }
+
+  case object Obj extends Base {
+    override def foo = true
+  }
+
+  case class Claz extends Base {
+    override def foo = true
+  } """ becomes
+    """
+  abstract class Base {
+    def /*(*/babar/*)*/ = false
+  }
+
+  case object Obj extends Base {
+    override def babar = true
+  }
+
+  case class Claz extends Base {
+    override def babar = true
+  } """
+  } applyRefactoring(renameTo("babar"))
+
+  @Test
+  def renameClassWithClassOfUsage() = new FileSet {
+    """
+    package renameClassWithClassOfUsage
+    class /*(*/Foo/*)*/ {
+      val clazz = classOf[Foo]
+    }
+    """ becomes
+    """
+    package renameClassWithClassOfUsage
+    class /*(*/Bar/*)*/ {
+      val clazz = classOf[Bar]
+    }
+    """
+  } applyRefactoring(renameTo("Bar"))
+
+  @Test
+  def renameClassExplicitSelfTypeAnnotation() = new FileSet {
+    """
+    package renameClassExplicitSelfTypeAnnotation
+    trait A
+    class /*(*/Foo/*)*/ {
+      self: Foo with A=>
+    }
+    """ becomes
+    """
+    package renameClassExplicitSelfTypeAnnotation
+    trait A
+    class /*(*/Babar/*)*/ {
+      self: Babar with A=>
+    }
+    """
+  } applyRefactoring(renameTo("Babar"))
+
+  @Test
+  def renameWithMultipleContextBounds() = new FileSet {
+    """
+    package test
+    class Foo[T] {
+      def /*(*/bar/*)*/[A: Numeric: Foo] = ""
+    }
+    """ becomes
+    """
+    package test
+    class Foo[T] {
+      def /*(*/babar/*)*/[A: Numeric: Foo] = ""
+    }
+    """
+  } applyRefactoring(renameTo("babar"))
+
+  @Test
+  def renameClassWithThisConstuctorCall() = new FileSet {
+    """
+    package renameClassWithThisConstuctorCall
+
+    class /*(*/Config/*)*/(sourcePaths: Set[String], outputDir: String = null) {
+     def this() = this(Set())
+    }
+    """ becomes
+    """
+    package renameClassWithThisConstuctorCall
+
+    class /*(*/ConfigX/*)*/(sourcePaths: Set[String], outputDir: String = null) {
+     def this() = this(Set())
+    }
+    """
+  } applyRefactoring(renameTo("ConfigX"))
+
+  @Test
+  def renameAbstractTypesInHierarchy() = new FileSet {
+    """
+    abstract class A {
+      type /*(*/Foo/*)*/
+      abstract class B extends A {
+        type Foo
+        class C extends B {
+          type Foo = Unit
+        }
+      }
+    }
+    """ becomes
+    """
+    abstract class A {
+      type /*(*/ConfigX/*)*/
+      abstract class B extends A {
+        type ConfigX
+        class C extends B {
+          type ConfigX = Unit
+        }
+      }
+    }
+    """
+  } applyRefactoring(renameTo("ConfigX"))
+
+  @Test
+  def renameClassSelfTypeAnnotation() = new FileSet {
+    """
+    package renameClassWithSelfTypeAnnotation
+    class /*(*/Foo/*)*/ {
+      self =>
+    }
+    """ becomes
+    """
+    package renameClassWithSelfTypeAnnotation
+    class /*(*/Bar/*)*/ {
+      self =>
+    }
+    """
+  } applyRefactoring(renameTo("Bar"))
+
+  @Test
+  def renameClassSelfTypeAnnotation2() = new FileSet {
+    """
+    package renameClassWithSelfTypeAnnotation
+    class /*(*/Foo/*)*/ {
+      self: Foo =>
+    }
+    """ becomes
+    """
+    package renameClassWithSelfTypeAnnotation
+    class /*(*/Babar/*)*/ {
+      self: Babar =>
+    }
+    """
+  } applyRefactoring(renameTo("Babar"))
+
+  @Test
+  def renameMethodWithContextBound() = new FileSet {
+    """
+object RenameWithContextBound {
+  val blubb = new Blubb
+
+  def /*(*/work/*)*/[A: Foo](f: Blubb => A): A = f(blubb) ensuring {
+    implicitly[Foo[A]].foo(_) >= 42
+  }
+}
+
+trait Foo[A] {
+  def foo(a: A): Int
+}
+
+class Blubb
+    """ becomes
+    """
+object RenameWithContextBound {
+  val blubb = new Blubb
+
+  def /*(*/abc/*)*/[A: Foo](f: Blubb => A): A = f(blubb) ensuring {
+    implicitly[Foo[A]].foo(_) >= 42
+  }
+}
+
+trait Foo[A] {
+  def foo(a: A): Int
+}
+
+class Blubb
+    """
+  } applyRefactoring(renameTo("abc"))
+
+  @Test
+  def coloncolon() = new FileSet {
+    """
+    object Problem07 {
+      def /*(*/flatten/*)*/(list: List[Any]): List[Any] = list match {
+        case (head@_::_)::tail => flatten(head) ++ flatten(tail)
+        case Nil::tail => flatten(tail)
+        case head::tail => head :: flatten(tail)
+        case Nil => Nil
+      }
+    }
+    """ becomes
+    """
+    object Problem07 {
+      def /*(*/fltn/*)*/(list: List[Any]): List[Any] = list match {
+        case (head@_::_)::tail => fltn(head) ++ fltn(tail)
+        case Nil::tail => fltn(tail)
+        case head::tail => head :: fltn(tail)
+        case Nil => Nil
+      }
+    }
+    """
+  } applyRefactoring(renameTo("fltn"))
+
+  @Test
+  def typeProjection() = new FileSet {
+    """
+    class A {
+      trait /*(*/B/*)*/
+      def foo(b: A#B) {}
+    }
+    """ becomes
+    """
+    class A {
+      trait /*(*/C/*)*/
+      def foo(b: A#C) {}
+    }
+    """
+  } applyRefactoring(renameTo("C"))
+
+  @Test
+  def overriddenMethod() = new FileSet {
+    """
+    package overriddenMethod.bar
+
+    trait Bar {
+      def bippy: String
+
+      def bar = bippy.toUpperCase
+    }
+    """ becomes """
+    package overriddenMethod.bar
+
+    trait Bar {
+      def booh: String
+
+      def bar = booh.toUpperCase
+    }
+    """
+    ;
+    """
+    package overriddenMethod
+    import bar.Bar
+
+    class Foo extends Bar {
+      override def /*(*/bippy/*)*/: String = "foo"
+    }
+    """ becomes
+    """
+    package overriddenMethod
+    import bar.Bar
+
+    class Foo extends Bar {
+      override def /*(*/booh/*)*/: String = "foo"
+    }
+    """
+  } applyRefactoring(renameTo("booh"))
+
+  @Ignore
+  @Test
+  def namedParameter() = new FileSet {
+    """
+    class NamedParameter {
+      def foo(/*(*/b/*)*/: Int, c: String) {
+        println(b)
+      }
+      foo(c = "", b = 5)
+    }
+    """ becomes
+    """
+    class NamedParameter {
+      def foo(/*(*/xys/*)*/: Int, c: String) {
+        println(xys)
+      }
+      foo(c = "", xys = 5)
+    }
+    """
+  } applyRefactoring(renameTo("xys"))
+
+  @Ignore
+  @Test
+  def namedParameterAndDefault() = new FileSet {
+    """
+    class NamedParameter {
+      def foo(/*(*/b/*)*/: Int, c: String = "") {
+        println(b)
+      }
+      foo(b = 5)
+    }
+    """ becomes
+    """
+    class NamedParameter {
+      def foo(/*(*/xys/*)*/: Int, c: String = "") {
+        println(xys)
+      }
+      foo(xys = 5)
+    }
+    """
+  } applyRefactoring(renameTo("xys"))
+
+  @Ignore
+  @Test
+  def namedParameterInDeclaredOrder() = new FileSet {
+    """
+    class NamedParameter {
+      def foo(/*(*/b/*)*/: Int, c: String) {
+        println(b)
+      }
+      foo(b = 5, c = "")
+    }
+    """ becomes
+    """
+    class NamedParameter {
+      def foo(/*(*/xys/*)*/: Int, c: String) {
+        println(xys)
+      }
+      foo(xys = 5, c = "")
+    }
+    """
+  } applyRefactoring(renameTo("xys"))
+
+  @Ignore
+  @Test
+  def namedParameterInSecondArgsList() = new FileSet {
+    """
+    class NamedParameter {
+      def foo(x: Int)(/*(*/b/*)*/: Int, c: String) {
+        println(b)
+      }
+      foo(5)(b = 5, c = "")
+    }
+    """ becomes
+    """
+    class NamedParameter {
+      def foo(x: Int)(/*(*/xys/*)*/: Int, c: String) {
+        println(xys)
+      }
+      foo(5)(xys = 5, c = "")
+    }
+    """
+  } applyRefactoring(renameTo("xys"))
+
+  @Ignore
+  @Test
+  def updateMethodAndNamedArgument() = new FileSet {
+    """
+    class Updateable { def update(/*(*/what/*)*/: Int, rest: Int) = 0 }
+
+    class NamedParameter {
+      val up = new Updateable
+      up(what = 1) = 2
+    }
+    """ becomes
+    """
+    class Updateable { def update(/*(*/xys/*)*/: Int, rest: Int) = 0 }
+
+    class NamedParameter {
+      val up = new Updateable
+      up(xys = 1) = 2
+    }
+    """
+  } applyRefactoring(renameTo("xys"))
+
+  @Test
+  def privatePrimaryConstructor() = new FileSet {
+    """
+    class /*(*/SomeClass/*)*/ private () extends AnyRef {
+      def meta = SomeClass
+    }
+    object SomeClass extends SomeClass
+    """ becomes
+    """
+    class /*(*/RenamedClass/*)*/ private () extends AnyRef {
+      def meta = RenamedClass
+    }
+    object RenamedClass extends RenamedClass
+    """
+  } applyRefactoring(renameTo("RenamedClass"))
+
+  @Test
+  def constructionInforComprehension() = new FileSet {
+    """
+    package constructorInForComprehension
+    case class /*(*/A/*)*/(val x: Int)
+
+    object Foo {
+      def doit = for (A(x) <- Seq(A(1), A(2))) yield x
+    }
+    """ becomes
+    """
+    package constructorInForComprehension
+    case class /*(*/BBB/*)*/(val x: Int)
+
+    object Foo {
+      def doit = for (BBB(x) <- Seq(BBB(1), BBB(2))) yield x
+    }
+    """
+  } applyRefactoring(renameTo("BBB"))
+
+  @Test
+  def privateMembersTupleNotation() = new FileSet {
+    """
+    package privateMembersTupleNotation
+    class /*(*/Test/*)*/ {
+
+      private val A, B, C = this
+    }
+    """ becomes
+    """
+    package privateMembersTupleNotation
+    class /*(*/MyTest/*)*/ {
+
+      private val A, B, C = this
+    }
+    """
+  } applyRefactoring(renameTo("MyTest"))
+
+  @Test
+  def renameMethodForComprehensionBody() = new FileSet {
+    """
+    package renameMethodForComprehensionBody
+    class Testing {
+      def isBlank[T](t: T) = false
+      object elt {
+        val child = List(1,2,3)
+      }
+
+      def /*(*/processContent/*)*/ {
+        for(node <- elt.child if !isBlank(node)) {
+          val element = new Array(node)
+        }
+      }
+    }
+    """ becomes
+    """
+    package renameMethodForComprehensionBody
+    class Testing {
+      def isBlank[T](t: T) = false
+      object elt {
+        val child = List(1,2,3)
+      }
+
+      def /*(*/getContent/*)*/ {
+        for(node <- elt.child if !isBlank(node)) {
+          val element = new Array(node)
+        }
+      }
+    }
+    """
+  } applyRefactoring(renameTo("getContent"))
+
+  @Test
+  def renameApplyCall() = new FileSet {
+    """
+    package renameApplyCall
+    object Foo {
+      val /*(*/xs/*)*/ = List(1,2,3)
+      def bar(): Unit = {
+        println(xs(0))
+        println(xs)
+
+      }
+    }
+    """ becomes
+    """
+    package renameApplyCall
+    object Foo {
+      val /*(*/list/*)*/ = List(1,2,3)
+      def bar(): Unit = {
+        println(list(0))
+        println(list)
+
+      }
+    }
+    """
+  } applyRefactoring(renameTo("list"))
+
+  @Test
+  def renameFinalVal() = new FileSet {
+    """
+    package renameFinalVal
+
+    object X {
+      final val /*(*/Value/*)*/ = 0
+    }
+    """ becomes
+    """
+    package renameFinalVal
+
+    object X {
+      final val /*(*/x/*)*/ = 0
+    }
+    """;
+    """
+    package renameFinalVal
+
+    class ClassA {
+      val value = X.Value
+    }
+    """ becomes """
+    package renameFinalVal
+
+    class ClassA {
+      val value = X.x
+    }
+    """
+  } applyRefactoring(renameTo("x"))
+
+  /*
+   * See Assembla ticket #1001928
+   */
+  @Test
+  def testRenameClassInSamePackageButOtherFile() = new FileSet {
+    """
+    class A
+    """ -> "A.scala" becomes
+    """
+    class B
+    """ -> "B.scala";
+
+    """
+    class C extends /*(*/A/*)*/
+    """ becomes
+    """
+    class C extends /*(*/B/*)*/
+    """
+  } applyRefactoring(renameTo("B"))
+
+
+  /*
+   * See Assembla ticket #1001928
+   */
+  @Test
+  def testRenameClassInDifferentPackageAndOtherFile() = new FileSet {
+    """
+    package one
+    class Eins
+    """ -> "Eins.scala" becomes
+    """
+    package one
+    class One
+    """ -> "One.scala";
+
+    """
+    package two
+    import one._
+
+    class Two {
+      val uno = new /*(*/Eins/*)*/
+    }
+    """ becomes
+    """
+    package two
+    import one._
+
+    class Two {
+      val uno = new /*(*/One/*)*/
+    }
+    """
+  } applyRefactoring(renameTo("One"))
+
+  @Test
+  def testClassInDedicatedFile() = new FileSet {
+    "class /*(*/Foo/*)*/" -> "Foo.scala" becomes
+    "class /*(*/Bazius/*)*/" -> "Bazius.scala"
+  } applyRefactoring(renameTo("Bazius"))
+
+  /*
+   * See Assembla ticket #1002435
+   */
+  @Test
+  def testRenamePublicValInPlainClass() = new FileSet {
+    """
+    class Bug(val /*(*/number/*)*/: Int)
+    """ becomes
+    """
+    class Bug(val /*(*/z/*)*/: Int)
+    """;
+
+    """
+    object Buggy {
+      def x = new Bug(32).number
+    }
+    """ becomes
+    """
+    object Buggy {
+      def x = new Bug(32).z
+    }
+    """ -> TaggedAsGlobalRename
+  } prepareAndApplyRefactoring(prepareAndRenameTo("z"))
+
+  /*
+   * See Assembla ticket #1002435
+   */
+  @Test
+  def testRenamePublicValInCaseClass() = new FileSet {
+    """
+    case class Bug(/*(*/number/*)*/: Int)
+    """ becomes
+    """
+    case class Bug(/*(*/z/*)*/: Int)
+    """;
+
+    """
+    object Buggy {
+      def x = Bug(32).number
+    }
+    """ becomes
+    """
+    object Buggy {
+      def x = Bug(32).z
+    }
+    """ -> TaggedAsGlobalRename
+  } prepareAndApplyRefactoring(prepareAndRenameTo("z"))
+
+  /*
+   * See Assembla ticket #1002435
+   */
+  @Test
+  def testRenamePublicValInTrait() = new FileSet {
+    """
+    trait Bug {
+      val /*(*/number/*)*/: Int
+    }
+    """ becomes
+    """
+    trait Bug {
+      val /*(*/x/*)*/: Int
+    }
+    """;
+
+    """
+    object Buggy {
+      def bug: Bug = ???
+      def x = bug.number
+    }
+    """ becomes
+    """
+    object Buggy {
+      def bug: Bug = ???
+      def x = bug.x
+    }
+    """ -> TaggedAsGlobalRename
+  } prepareAndApplyRefactoring(prepareAndRenameTo("x"))
+
+  @Test
+  def testRenamePublicVarInPlainClass() = new FileSet {
+    """
+    class Bug(var /*(*/number/*)*/: Int)
+    """ becomes
+    """
+    class Bug(var /*(*/z/*)*/: Int)
+    """;
+
+    """
+    object Buggy {
+      def x = new Bug(32).number
+    }
+    """ becomes
+    """
+    object Buggy {
+      def x = new Bug(32).z
+    }
+    """ -> TaggedAsGlobalRename
+  } prepareAndApplyRefactoring(prepareAndRenameTo("z"))
+
+  @Test
+  def testRenamePrivateVarInPlainClass() = new FileSet {
+    """
+    class Bug {
+      private var /*(*/number/*)*/ = 42
+      def test = number
+    }
+    """ becomes
+    """
+    class Bug {
+      private var /*(*/z/*)*/ = 42
+      def test = z
+    }
+    """ -> TaggedAsLocalRename;
+  } prepareAndApplyRefactoring(prepareAndRenameTo("z"))
+
+  @Test
+  def testRenamePkgPrivateVal() = new FileSet {
+    """
+    package test
+    class Bug(private[test] val /*(*/number/*)*/: Int)
+    """ becomes
+    """
+    package test
+    class Bug(private[test] val /*(*/z/*)*/: Int)
+    """;
+
+    """
+    package test
+    object Buggy {
+      def x = new Bug(32).number
+    }
+    """ becomes
+    """
+    package test
+    object Buggy {
+      def x = new Bug(32).z
+    }
+    """ -> TaggedAsGlobalRename
+  } prepareAndApplyRefactoring(prepareAndRenameTo("z"))
+
+  /*
+   * See Assembla Ticket #1002446
+   */
+  @Test
+  def testRenamePkgPrivateDef() = new FileSet {
+    """
+    package bug
+    class Bug {
+      private[bug] def /*(*/bar/*)*/ = 99
+    }
+    """ becomes
+    """
+    package bug
+    class Bug {
+      private[bug] def /*(*/x/*)*/ = 99
+    }
+    """ -> TaggedAsGlobalRename
+  } prepareAndApplyRefactoring(prepareAndRenameTo("x"))
+
+  @Test
+  def testRenamePrivateThisVal() = new FileSet {
+    """
+    class Bug {
+      private[this] val /*(*/nautilus/*)*/ = 99
+    }
+    """ becomes
+    """
+    class Bug {
+      private[this] val /*(*/z/*)*/ = 99
+    }
+    """ -> TaggedAsLocalRename
+  } prepareAndApplyRefactoring(prepareAndRenameTo("z"))
+
+  @Test
+  def testRenameValWithCommentAfterModifier() = new FileSet {
+    """
+    class Bug {
+      private/*--*/ val /*(*/nautilus/*)*/ = 99
+    }
+    """ becomes
+    """
+    class Bug {
+      private/*--*/ val /*(*/z/*)*/ = 99
+    }
+    """ -> TaggedAsLocalRename
+  } prepareAndApplyRefactoring(prepareAndRenameTo("z"))
+
+  @Test
+  def testRenamePkgPrivateValWithComments() = new FileSet {
+    """
+    package bug
+    class Bug {
+      private/*--*/ //**//**//**//**//**/
+      // -/**/-
+      // -/**/-
+      [/**/ bug /**/] val /*(*/nautilus/*)*/ = 99
+    }
+    """ becomes
+    """
+    package bug
+    class Bug {
+      private/*--*/ //**//**//**//**//**/
+      // -/**/-
+      // -/**/-
+      [/**/ bug /**/] val /*(*/z/*)*/ = 99
+    }
+    """ -> TaggedAsGlobalRename
+  } prepareAndApplyRefactoring(prepareAndRenameTo("z"))
+
+  @Test
+  def testRenamePkgProtectedDefWithComments() = new FileSet {
+    """
+    package bug
+    class Bug {
+      protected/*--*/ //**//**//**//**//**/
+      ////
+      // -/**/-
+      // -/**/-
+      [/**/ bug /**/] /**/ def /*(*/nautilus/*)*/ = 99
+    }
+    """ becomes
+    """
+    package bug
+    class Bug {
+      protected/*--*/ //**//**//**//**//**/
+      ////
+      // -/**/-
+      // -/**/-
+      [/**/ bug /**/] /**/ def /*(*/z/*)*/ = 99
+    }
+    """ -> TaggedAsGlobalRename
+  } prepareAndApplyRefactoring(prepareAndRenameTo("z"))
+
+  /*
+   * Correctly renaming package private lazy vals is not as easy as one might hope,
+   * because of their representation in the ASTs, both as "ValDef"s and "DefDef"s.
+   */
+  @Ignore
+  @Test
+  def testRenamePkgProtectedLazyVal() = new FileSet {
+    """
+    package experiments
+    class Clazz {
+      private[experiments] lazy val /*(*/x/*)*/ = 999
+    }""" becomes
+    """
+    package experiments
+    class Clazz {
+      private[experiments] lazy val /*(*/xy/*)*/ = 999
+    }""" -> TaggedAsGlobalRename
+  } prepareAndApplyRefactoring(prepareAndRenameTo("xy"))
+
+
+  /*
+   * See Assembla Ticket 1002434
+   */
+  @Test
+  def testRenameOverrideVal() = new FileSet {
+    """
+    trait Bug {
+      def x = 42
+    }
+    """ becomes
+    """
+    trait Bug {
+      def xyz = 42
+    }
+    """;
+
+    """
+    class Buggy extends Bug {
+      override val x = 43
+    }
+    """ becomes
+    """
+    class Buggy extends Bug {
+      override val xyz = 43
+    }
+    """;
+
+    """
+    class MoreBugs extends Buggy {
+      override val /*(*/x/*)*/ = 99
+    }
+    """ becomes
+    """
+    class MoreBugs extends Buggy {
+      override val /*(*/xyz/*)*/ = 99
+    }
+    """ -> TaggedAsGlobalRename
+  } prepareAndApplyRefactoring(prepareAndRenameTo("xyz"))
+
+  /*
+   * See Assembla Ticket 1002490
+   */
+  @Test
+  def testRenameClassWithCompanion() = new FileSet {
+    """
+    class /*(*/Bug/*)*/
+    object Bug
+    """ -> "Bug.scala" becomes
+    """
+    class /*(*/Buggy/*)*/
+    object Buggy
+    """ -> "Buggy.scala"
+  } applyRefactoring(renameTo("Buggy"))
+
+  /*
+   * See Assembla Ticket 1002436
+   */
+  @Test
+  def testRenameTypeAnnotatingLazyVal() = new FileSet {
+    """
+    class /*(*/Bug/*)*/
+
+    class Buggy {
+      lazy val bug: Bug = new Bug
+
+      def moreBugs = {
+        lazy val buggy: Bug = new Bug
+        val notBuggy: Bug = new Bug
+        buggy.hashCode + notBuggy.hashCode
+      }
+    }
+    """ becomes
+    """
+    class /*(*/Mistkaefer/*)*/
+
+    class Buggy {
+      lazy val bug: Mistkaefer = new Mistkaefer
+
+      def moreBugs = {
+        lazy val buggy: Mistkaefer = new Mistkaefer
+        val notBuggy: Mistkaefer = new Mistkaefer
+        buggy.hashCode + notBuggy.hashCode
+      }
+    }
+    """
+  } applyRefactoring(renameTo("Mistkaefer"))
+
+  @Test
+  def testRenameTypeAnnotatingLazyValMinimal() = new FileSet {
+    """
+    object Buggy {
+      class /*(*/Bug/*)*/
+      def err = {
+        lazy val bug: Bug = new Bug
+        bug.hashCode
+      }
+    }
+    """ becomes
+    """
+    object Buggy {
+      class /*(*/Mistkaefer/*)*/
+      def err = {
+        lazy val bug: Mistkaefer = new Mistkaefer
+        bug.hashCode
+      }
+    }
+    """
+  } applyRefactoring(renameTo("Mistkaefer"))
+
+  /*
+   * See Assembla Ticket #1002498
+   */
+  @Test
+  def testRenameProtectedOverrideDef() = new FileSet {
+    """
+    trait Bug {
+      protected def /*(*/br0ken/*)*/: Int
+    }
+
+    class Buggy extends Bug {
+      protected override def br0ken = 9
+    }
+    """ becomes
+    """
+    trait Bug {
+      protected def /*(*/ups/*)*/: Int
+    }
+
+    class Buggy extends Bug {
+      protected override def ups = 9
+    }
+    """
+  } applyRefactoring(renameTo("ups"))
+
+  /*
+   * See Assembla Ticket #1002498
+   */
+  @Test
+  def testRenameProtectedOverrideVal() = new FileSet {
+    """
+    trait Bug {
+      protected val /*(*/br0ken/*)*/: Int
+    }
+
+    class Buggy extends Bug {
+      protected override val br0ken = 9
+    }
+    """ becomes
+    """
+    trait Bug {
+      protected val /*(*/ups/*)*/: Int
+    }
+
+    class Buggy extends Bug {
+      protected override val ups = 9
+    }
+    """
+  } applyRefactoring(renameTo("ups"))
+
+  @Test
+  def testRenameOverrideProtected() = new FileSet {
+    """
+    trait Base {
+      protected def /*(*/x/*)*/: Int
+    }
+
+    class Derived1 extends Base {
+      override protected val x = 9
+    }
+
+    class Derived2 extends Base {
+      override protected def x = 9
+    }
+    """ becomes
+    """
+    trait Base {
+      protected def /*(*/xxx/*)*/: Int
+    }
+
+    class Derived1 extends Base {
+      override protected val xxx = 9
+    }
+
+    class Derived2 extends Base {
+      override protected def xxx = 9
+    }
+    """
+  } applyRefactoring(renameTo("xxx"))
+}
+
+/*
+ * Copyright 2005-2010 LAMP/EPFL
+ */
+
+package scala.tools.refactoring
+package tests.analysis
+
+import org.junit.Assert.assertEquals
+
+import analysis.CompilationUnitDependencies
+import common.TreeExtractors
+import tests.util.FreshCompilerForeachTest
+import tests.util.TestHelper
+
+class CompilationUnitDependenciesTest extends TestHelper with CompilationUnitDependencies with TreeExtractors with FreshCompilerForeachTest {
+
+  import global._
+
+  private def assertTrees(expected: String, src: String, javaSrc: String, addScalaSrc: String, f: Tree => Seq[Tree]) {
+    if (!javaSrc.isEmpty) parseJava(javaSrc)
+    if (!addScalaSrc.isEmpty) parseScalaAndVerify(addScalaSrc)
+    val tree = parseScalaAndVerify(src)
+
+    val imports = global.ask {() =>
+      val res = f(tree)
+      res.sortBy(_.toString).map(asString)
+    }
+
+    assertEquals(expected.split("\n").map(_.trim).mkString("\n"), imports.mkString("\n"))
+  }
+
+  def assertNeededImports(expected: String, src: String, javaSrc: String = "", addScalaSrc: String = ""): Unit =
+    assertTrees(expected, src, javaSrc, addScalaSrc, neededImports)
+
+  def assertDependencies(expected: String, src: String, javaSrc: String = "", addScalaSrc: String = ""): Unit =
+    assertTrees(expected, src, javaSrc, addScalaSrc, dependencies)
+
+  @Test
+  def evidenceNoImport() = assertNeededImports(
+    """""",
+    """
+    trait Transformations {
+
+      abstract class Transformation[X, Y] {
+        def apply(x: X): Option[Y]
+      }
+
+      def allChildren[X <% (X ⇒ Y) ⇒ Y, Y](t: ⇒ Transformation[X, Y]) = new Transformation[X, Y] {
+        def apply(in: X): Option[Y] = {
+          Some(in(child => t(child) getOrElse (return None)))
+        }
+      }
+    }
+    """)
+
+  @Test
+  def evidence() = assertDependencies(
+    """scala.Some""",
+    """
+    trait Transformations {
+
+      abstract class Transformation[X, Y] {
+        def apply(x: X): Option[Y]
+      }
+
+      def allChildren[X <% (X ⇒ Y) ⇒ Y, Y](t: ⇒ Transformation[X, Y]) = new Transformation[X, Y] {
+        def apply(in: X): Option[Y] = {
+          Some(in(child => t(child) getOrElse (return None)))
+        }
+      }
+    }
+    """)
+
+  @Test
+  def typeFromScalaPackage() = assertDependencies(
+    """""",
+    """
+       object NoRuleApplies extends Exception("No Rule Applies")
+    """)
+
+  @Test
+  def abstractValType() = assertDependencies(
+    """java.util.Observable
+       scala.collection.mutable.ListBuffer""",
+    """
+       import collection.mutable._
+       import java.util._
+       trait X {val lb: ListBuffer[Int]; val ob: Observable}
+    """)
+
+  @Test
+  def dependencyOnMultipleOverloadedMethods() = assertNeededImports(
+    """scala.math.BigDecimal.apply""",
+    """
+      import scala.math.BigDecimal._
+
+      class C {
+        def m() {
+          apply("5")
+          apply(5l)
+        }
+      }
+    """)
+
+  @Test
+  def typeArgument() = assertDependencies(
+    """scala.collection.mutable.ListBuffer""",
+    """
+       import collection.mutable._
+       trait X {
+         def m: Either[Int, Option[List[ListBuffer[ListBuffer[Int]]]]]
+       }
+    """)
+
+  @Test
+  def objectType() = assertDependencies(
+    """<root>.scala.io.Source""",
+    """
+      import scala.io._
+      class MNO { var no: Source.type = null }
+      """)
+
+  @Test
+  def objectTypeRequiresImport() = assertNeededImports(
+    """<root>.scala.io.Source""",
+    """
+      import scala.io._
+      class MNO { var no: Source.type = null }
+      """)
+
+  @Test
+  def valAnnotation() = assertDependencies(
+    """java.lang.Object
+       scala.beans.BeanProperty
+       scala.this.Predef.String""",
+    """
+      import scala.beans.BeanProperty
+      case class JavaPerson(@BeanProperty var name: String, @BeanProperty var addresses: java.lang.Object)
+      """)
+
+  @Test
+  @ScalaVersion(matches="2.10.0")
+  def switchAnnotation210() = assertDependencies(
+    """Integer.parseInt
+       java.this.lang.Integer
+       scala.annotation.switch""",
+    """
+      import scala.annotation._
+      object ASwitch {
+        val x = (Integer.parseInt("5"): @switch) match {
+          case 5 => true
+          case 6 => false
+        }
+      }
+      """)
+
+  @Test
+  @ScalaVersion(matches="2.10.1")
+  def switchAnnotation2101() = assertDependencies(
+    """java.this.lang.Integer
+       scala.annotation.switch""",
+    """
+      import scala.annotation._
+      object ASwitch {
+        val x = (Integer.parseInt("5"): @switch) match {
+          case 5 => true
+          case 6 => false
+        }
+      }
+      """)
+
+  @Test
+  @ScalaVersion(matches="2.11")
+  def switchAnnotation() = assertDependencies(
+    """java.this.lang.Integer
+       scala.annotation.switch""",
+    """
+      import scala.annotation._
+      object ASwitch {
+        val x = (Integer.parseInt("5"): @switch) match {
+          case 5 => true
+          case 6 => false
+        }
+      }
+      """)
+
+  @Test
+  def annotationRequiresImport() = assertNeededImports(
+    """scala.beans.BeanProperty""",
+    """
+      import scala.beans.BeanProperty
+      case class JavaPerson(@BeanProperty var name: String, @BeanProperty var addresses: java.lang.Object)
+      """)
+
+  @Test
+  def classAttributeDeps() = assertDependencies(
+    """scala.collection.mutable.Map
+       scala.this.Predef.String""",
+    """
+      import scala.collection.mutable.Map
+      class UsesMap { val x = Map[Int, String]() }
+      """)
+
+  @Test
+  def classAttributeRequiresImport() = assertNeededImports(
+    """scala.collection.mutable.Map""",
+    """
+      import scala.collection.mutable.Map
+      class UsesMap { val x = Map[Int, String]() }
+    """)
+
+  @Test
+  def fullAndShortNames() = assertNeededImports(
+    """scala.collection.mutable.Map
+       scala.collection.mutable.Set""",
+    """
+      import scala.collection.mutable.Map
+      import scala.collection.mutable.Set
+      class UsesMap {
+        val x1 = Map[Int, String]()
+        val x2 = scala.collection.mutable.Map[Int, String]()
+
+        val y2 = scala.collection.mutable.Set[String]()
+        val y1 = Set[String]()
+      }
+    """)
+
+  @Test
+  def renamedImport() = assertDependencies(
+    """scala.collection.mutable.Map
+       scala.this.Predef.String""",
+    """
+      import scala.collection.mutable.{Map => M}
+      class UsesMap { val x = M[Int, String]() }
+      """)
+
+  @Test
+  def renamedImportIsNeeded() = assertNeededImports(
+    """scala.collection.mutable.Map""",
+    """
+      import scala.collection.mutable.{Map => M}
+      class UsesMap { val x = M[Int, String]() }
+    """)
+
+  @Test
+  def localImport() = assertDependencies(
+    """scala.this.Predef.println
+       x.B""",
+    """
+      class A {
+        val B = new {
+          val y = 2
+        }
+      }
+
+      object CLocalImport {
+        def m(x: A) {
+          import x._
+          println(B.y)
+        }
+      }
+      """)
+
+  @Test
+  def localImportNotNeeded() = assertNeededImports(
+    "",
+    """
+      class A {
+        val B = new {
+          val y = 2
+        }
+      }
+
+      object ClocalImportNotNeeded {
+        def m(x: A) {
+          import x._
+          println(B.y)
+        }
+      }
+      """)
+
+  @Test
+  def classAttributeWithFullPackage() = assertDependencies(
+    """scala.collection.mutable.Map
+       scala.this.Predef.String""",
+    """
+      class UsesMap { val x = collection.mutable.Map[Int, String]() }
+      """)
+
+  @Test
+  def classAttributeWithFullPackageNoImports() = assertNeededImports(
+    "",
+    """
+      class UsesMap { val x = collection.mutable.Map[Int, String]() }
+      """)
+
+  @Test
+  def etaExpandedMethod() = assertNeededImports(
+    "",
+    """
+      trait A {
+        val x = Set()
+        x filterNot (x ++ x contains)
+      }      """)
+
+  @Test
+  def classAttributeWithWildcardImport() = assertDependencies(
+    """scala.collection.mutable.HashSet""",
+    """
+      import collection._
+      class UsesMap { val x = mutable.HashSet[Int]() }
+      """)
+
+  @Test
+  def classAttributeWithWildcardImportNeeded() = assertNeededImports(
+    """scala.collection.mutable""",
+    """
+      import collection._
+      class UsesMap { val x = mutable.HashSet[Int]() }
+      """)
+
+  @Test
+  def importIsUsedAsType() = assertDependencies(
+    """java.util.ArrayList""",
+    """
+      import java.util._
+      class UsesMap { def x(m: java.util.ArrayList[Int]) = () }
+      """)
+
+  @Test
+  def importIsUsedAsTypeButNotNeeded() = assertNeededImports(
+    "",
+    """
+      import java.util._
+      class UsesMap { def x(m: java.util.ArrayList[Int]) = () }
+      """)
+
+  @Test
+  @ScalaVersion(matches="2.10")
+  def importIsUsedAsTypeAscription210() = assertDependencies(
+    """scala.collection.immutable.Set
+       scala.this.Predef.Map
+       scala.this.Predef.any2ArrowAssoc""",
+    """
+      class UsesSet { val s: collection.immutable.Set[Any] = Map(1 -> 2).toSet }
+      """)
+
+  @Test
+  @ScalaVersion(matches="2.11")
+  def importIsUsedAsTypeAscription() = assertDependencies(
+    """scala.collection.immutable.Set
+       scala.this.Predef.ArrowAssoc
+       scala.this.Predef.Map""",
+    """
+      class UsesSet { val s: collection.immutable.Set[Any] = Map(1 -> 2).toSet }
+      """)
+
+  @Test
+  def importIsUsedAsTypeAscriptionNeeded() = assertNeededImports(
+    "",
+    """
+      class UsesSet { val s: collection.immutable.Set[Any] = Map(1 -> 2).toSet }
+      """)
+
+  @Test
+  def typeUsedAsParent() = assertDependencies(
+    """java.util.Observer""",
+    """
+      import java.util.Observer
+      trait X extends Observer
+      """)
+
+  @Test
+  def typeUsedAsParentImportNeeded()= assertNeededImports(
+    """java.util.Observer""",
+    """
+      import java.util.Observer
+      trait X extends Observer
+      """)
+
+  @Test
+  def singleTypeUsedAsSelfTypeAnnotation() = assertDependencies(
+    """java.util.Observer""",
+    """
+      package singleTypeUsedAsSelfTypeAnnotation
+      import java.util.Observer
+      trait X {
+        this: Observer =>
+      }
+      """)
+
+  @Test
+  def singleTypeUsedAsSelfTypeAnnotationImport() = assertNeededImports(
+    """java.util.Observer""",
+    """
+      import java.util.Observer
+      trait X {
+        self: Observer =>
+      }
+      """)
+
+  @Test
+  def typeUsedAsSelfTypeAnnotation() = assertDependencies(
+    """java.util.Observable
+         java.util.Observer""",
+    """
+      import java.util.Observer
+      import java.util.Observable
+      trait Y
+      trait X {
+        this: Observer with Observable with Y =>
+      }
+      """)
+
+  @Test
+  def typeUsedAsSelfTypeAnnotationImportsNeeded() = assertNeededImports(
+    """java.util.Observable
+         java.util.Observer""",
+    """
+      import java.util.Observer
+      import java.util.Observable
+      trait Y
+      trait X {
+        this: Observer with Observable with Y =>
+      }
+      """)
+
+  @Test
+  def compoundTypeTree() = assertDependencies(
+    """java.util.Observable
+         java.util.Observer""",
+    """
+      import java.util.Observer
+      trait X {
+        def x(y: Observer with java.util.Observable) = ()
+      }
+      """)
+
+  @Test
+  def typeUsedAsBound()= assertDependencies(
+    """java.util.Observer""",
+    """
+      import java.util.Observer
+      class X[T <: Observer] {
+      }
+      """)
+
+  @Test
+  def typeUsedAsBoundNeeded() = assertNeededImports(
+    """java.util.Observer""",
+    """
+      import java.util.Observer
+      class X[T <: Observer] {
+      }
+      """)
+
+  @Test
+  def qualifiedAndUnqualifiedImports() = assertNeededImports(
+    """scala.collection.mutable.HashMap""",
+    """
+      import collection.mutable.HashMap
+
+      trait A {
+        val x = new HashMap[String, String]
+        val y = new collection.mutable.HashMap[String, String]
+      }
+      """)
+
+  @Test
+  def importStaticMethodDependency() = assertDependencies(
+    """java.lang.Integer.parseInt""",
+    """
+      import java.lang.Integer._
+      class Y {
+        val s = parseInt("5")
+      }
+      """)
+
+  @Test
+  def importStaticMethodNeeded() = assertNeededImports(
+    """java.lang.Integer.parseInt""",
+    """
+      import java.lang.Integer._
+      class Y {
+        val s = parseInt("5")
+      }
+      """)
+
+  @Test
+  def typeUsedInNew() = assertDependencies(
+    """scala.this.Predef.intWrapper
+       scala.util.Random""",
+    """
+      import scala.util._
+      class X {
+        val r = new Random
+        (0 to 10) map (_ => r.nextInt) sum
+      }
+      """)
+
+  @Test
+  def typeUsedInNewNeeded() = assertNeededImports(
+    """scala.util.Random""",
+    """
+      import scala.util._
+      class X {
+        val r = new Random
+        (0 to 10) map (_ => r.nextInt) sum
+      }
+      """)
+
+  @Test
+  def dependenciesAreUnique() = assertDependencies(
+    """scala.collection.mutable.ListBuffer""",
+    """
+      import scala.collection.mutable.ListBuffer
+      trait DependenciesAreUnique {val x: ListBuffer[Int]; val y: ListBuffer[Int]}
+      """)
+
+  @Test
+  def existential() = assertDependencies(
+    """java.util.Map""",
+    """
+      import java.util._
+      trait Y {
+        def build(ignored: Map[_, _])
+      }
+      """)
+
+  @Test
+  def existentialTypeTree() = assertNeededImports(
+    """java.util.Map""",
+    """
+      import java.util._
+      trait Y {
+        def build(ignored: Map[_, _])
+      }
+      """)
+
+  @Test
+  def renamedPackage() = assertDependencies(
+    """java.util.Map""",
+    """
+      import java.{ lang => jl, util => ju }
+      trait Y {
+        def build(ignored : ju.Map[_, _])
+      }
+      """)
+
+  @Test
+  def renamedPackageImport() = assertNeededImports(
+    """java.util""",
+    """
+      import java.{ lang => jl, util => ju }
+      trait Y {
+        def build(ignored : ju.Map[_, _])
+      }
+      """)
+
+  @Test
+  def importFromPackageObject() = assertDependencies(
+    """scala.collection.`package`.breakOut
+       scala.this.Predef.Map
+       scala.this.Predef.identity""",
+    """
+      import scala.collection.breakOut
+      object TestbreakOut {
+        val xs: Map[Int, Int] = List((1, 1), (2, 2)).map(identity)(breakOut)
+      }
+      """)
+
+  @Test
+  def selfTypeFromThis() = assertDependencies(
+    """""",
+    """
+      trait A {
+        trait A2
+      }
+      class C extends A {
+        trait C2 {
+          this: A2 =>
+        }
+      }
+      """)
+
+  @Test
+  def somePackages() = assertDependencies(
+    """a.X""",
+    """
+      package a {
+        trait X
+      }
+
+      package b {
+        trait Y extends a.X
+      }
+      """)
+
+  @Test
+  def somePackagesButNoImports() = assertNeededImports(
+    "",
+    """
+      package a {
+        trait X
+      }
+
+      package b {
+        trait Y extends a.X
+      }
+      """)
+
+  @Test
+  def importedImplicitConversion() = assertDependencies(
+    """java.util.List
+       scala.collection.JavaConversions.bufferAsJavaList
+       scala.collection.mutable.ListBuffer""",
+    """
+      import scala.collection.JavaConversions._
+      object Conversions {
+        val sl = new scala.collection.mutable.ListBuffer[Int]
+        val jl : java.util.List[Int] = sl
+      }
+      """)
+
+  @Test
+  def importedImplicitConversionNeedsImport() = assertNeededImports(
+    """scala.collection.JavaConversions.bufferAsJavaList""",
+    """
+      import scala.collection.JavaConversions._
+      object Conversions {
+        val sl = new scala.collection.mutable.ListBuffer[Int]
+        val jl : java.util.List[Int] = sl
+      }
+      """)
+
+  @Test
+  def importedImplicitConversionNeedsImportShortForm() = assertNeededImports(
+    """scala.collection.JavaConversions.asScalaBuffer""",
+    """
+      import collection.JavaConversions._
+      class ListConversion {
+        val l = new java.util.ArrayList[String]
+        l map (_.toInt)
+      }
+    """)
+
+  @Test
+  def importedImplicitArgument() {
+
+    addToCompiler("xy.scala", """
+      package impl.args
+      object Implicits {
+        implicit val x = "<empty>"
+      }
+    """)
+
+    assertNeededImports(
+    """impl.args.Implicits.x""",
+    """
+      import impl.args.Implicits._
+      object Conversions {
+        def doWithImpl(a: Int)(implicit s: String) = s
+        doWithImpl(5)
+      }
+      """)
+
+    assertDependencies(
+    """impl.args.Implicits.x
+       scala.this.Predef.String""",
+    """
+      import impl.args.Implicits._
+      object Conversions {
+        def doWithImpl(a: Int)(implicit s: String) = s
+        doWithImpl(5)
+      }
+      """)
+  }
+
+  /*
+   * Note:
+   * 	Previous versions of this test expected the dependency `Param.global.X`.
+   *  This is wrong however, as X is satisfied by local imports, that work
+   *  as long as `Param` is in scope.
+   */
+  @Test
+  def importFromLocalValueDependency() = assertDependencies(
+    "",
+    """
+      trait Param {
+        object global { trait X }
+      }
+      trait SomeTrait {
+        def method(param: Param) {
+          import param._
+          import global._
+          var x: X = null
+        }
+      }
+    """)
+
+  @Test
+  def importFromLocalValueNoImport() = assertNeededImports(
+    """""",
+    """
+      trait Param {
+        object global { trait X }
+      }
+      trait SomeTrait {
+        def method(param: Param) {
+          import param._
+          import global._
+          var x: X = null
+        }
+      }
+    """)
+
+  @Test
+  def classOfRequiresImport() = assertNeededImports(
+    """scala.io.Source""",
+    """
+      import scala.io.Source
+
+      object Dummy {
+        val clazz = classOf[Source]
+      }
+    """)
+
+  @Test
+  def SystemcurrentTimeMillis() = assertNeededImports(
+    """java.this.lang.System.currentTimeMillis""",
+    """
+      import System.currentTimeMillis
+
+      object Dummy {
+        val x = currentTimeMillis
+      }
+    """)
+
+  @Test
+  def SystemcurrentTimeMillisDeps() = assertDependencies(
+    """java.this.lang.System.currentTimeMillis""",
+    """
+      import System.currentTimeMillis
+
+      object Dummy {
+        val x = currentTimeMillis
+      }
+    """)
+
+  @Test
+  def ClassInAnnotationAttrArg() = assertNeededImports(
+    """java.util.Calendar""",
+    """
+      import java.util.Calendar
+
+      class DeprecatedAnnotation {
+        @deprecated(message = "", since = ""+ Calendar.YEAR)
+       def read() = ()
+      }
+    """)
+
+  @Test
+  def ClassInAnnotationImports() = assertNeededImports(
+    """java.io.BufferedReader
+       java.io.FileReader
+       java.io.IOException""",
+    """
+      package examples
+
+      import java.io._
+
+      class Reader(fname: String) {
+        private val in = new BufferedReader(new FileReader(fname))
+        @throws(classOf[IOException])
+        def read() = in.read()
+      }
+    """)
+
+  @Test
+  def ClassInAnnotationDeps() = assertDependencies(
+    """java.io.BufferedReader
+       java.io.FileReader
+       java.io.IOException
+       scala.this.Predef.String""",
+    """
+      package examples
+
+      import java.io._
+
+      class Reader(fname: String) {
+        private val in = new BufferedReader(new FileReader(fname))
+        @throws(classOf[IOException])
+        def read() = in.read()
+      }
+    """)
+
+  @Test
+  def implicitDefImports()  = assertNeededImports(
+    "", """class ImplicitDef {
+
+      val readBuffer = Array.ofDim[Byte](1024)
+      val dataId: (Byte, Byte) = readBuffer.slice(0, 2)
+
+      implicit def arrayTo2Tuple[T](a: Array[T]): (T, T) = {
+        (a(0), a(1))
+      }
+    }""")
+
+  @Test
+  def implicitDef() = assertDependencies(
+    """scala.reflect.ClassTag
+       scala.this.Predef.byteArrayOps""",
+    """class ImplicitDef {
+
+      // In Scala 2.10.x, the macro expansion was seen in the presentation compiler
+      // and a dependency on ClassTag.Byte was detected. After the change in
+      // 2.11 to keep the macro expandee in the tree, this is no longer reported.
+      // Here, we add the implicit ourselves to make the test behave the same on
+      // both Scala versions.
+      implicit def byteClassTag: scala.reflect.ClassTag[Byte] = null
+
+      val readBuffer = Array.ofDim[Byte](1024)
+      val dataId: (Byte, Byte) = readBuffer.slice(0, 2)
+
+      implicit def arrayTo2Tuple[T](a: Array[T]): (T, T) = {
+        (a(0), a(1))
+      }
+    }""")
+
+  @Test
+  def annotationOnPrimaryConstructor() = assertDependencies(
+    "java.lang.annotation.Documented",
+    """
+      import java.lang.annotation.Documented
+
+      class Foo @Documented() (i: Int)
+    """)
+
+
+  @Test
+  def annotationOnField() = assertDependencies(
+    "java.lang.annotation.Documented",
+    """
+      import java.lang.annotation.Documented
+
+      class Foo {
+        @Documented()
+        def xx(i: Int) = i
+      }
+    """)
+
+  @Test
+  def importLocallyDefinedClass() = assertNeededImports(
+    "test.MyType",
+    """import test.MyType
+       package test {
+          class MyType
+       }
+       class Test(myType: MyType)
+    }""")
+
+  @Test
+  def importLocallyDefniedClassNotNeeded = assertNeededImports(
+    "",
+    """package test {
+          class MyType
+          class Test(myType: MyType)
+       }
+    }""")
+
+  @ScalaVersion(matches="2.11")
+  @Test
+  def testWithSimpleJavaAnnotation = assertNeededImports(
+    "test.Foo",
+    """import test._
+
+       package test {
+         class Foo
+       }
+
+       @AnAnnotation(classOf[Foo])
+       class Bug
+    """,
+    """public @interface AnAnnotation {
+         Class<?> value();
+       }""")
+
+  @ScalaVersion(matches="2.11")
+  @Test
+  def testWithSimpleJavaAnnotationAndLocalClass = assertNeededImports(
+    "",
+    """package test
+
+       class InSamePackage
+
+       @AnAnnotation(classOf[InSamePackage])
+       class Bug
+    """,
+    """public @interface AnAnnotation {
+         Class<?> value();
+       }""")
+
+  @ScalaVersion(matches="2.11")
+  @Test
+  def testWithSimpleJavaAnnotationOnDef = assertNeededImports(
+    "test.Foo",
+    """import test._
+
+       package test {
+         class Foo
+       }
+
+       object Bug {
+         @AnAnnotation(classOf[Foo])
+         def f(x: Int) = x
+       }
+    """,
+    """public @interface AnAnnotation {
+         Class<?> value();
+       }""")
+
+  @ScalaVersion(matches="2.11")
+  @Test
+  def testWithSimpleJavaAnnotationOnParam = assertNeededImports(
+    "test.Foo",
+    """import test._
+
+       package test {
+         class Foo
+       }
+
+       object Bug {
+         def f(@AnAnnotation(classOf[Foo]) x: Int) = x
+       }
+    """,
+    """public @interface AnAnnotation {
+         Class<?> value();
+       }""")
+
+  @ScalaVersion(matches="2.11")
+  @Test
+  def testWithSimpleJavaAnnotationOnCtor = assertNeededImports(
+    "test.Foo",
+    """import test._
+
+       package test {
+         class Foo
+       }
+
+       class Bug @AnAnnotation(classOf[Foo]) ()
+    """,
+    """public @interface AnAnnotation {
+         Class<?> value();
+       }""")
+
+  @ScalaVersion(matches="2.11")
+  @Test
+  def testWithSimpleJavaAnnotationLocalClassAndMultiplePackages = assertNeededImports(
+    "",
+    """package test1 {
+
+       }
+
+       package test2 {
+         class InSamePackage
+
+         @AnAnnotation(classOf[InSamePackage])
+         class Bug
+      }
+    """,
+    """public @interface AnAnnotation {
+         Class<?> value();
+       }""")
+
+  @ScalaVersion(matches="2.11")
+  @Test
+  def testWithMoreComplexJavaAnnotation = assertNeededImports(
+    """test1.Bar
+       test1.Foo""",
+    """package test1 {
+         class Foo
+         class Bar
+       }
+
+       package test2 {
+         class Foo
+       }
+
+       package test3 {
+         import test1._
+         class LocalFoo
+
+         @AnAnnotation(
+            clazz1 = classOf[Foo],
+            clazz2 = classOf[Bar],
+            clazz3 = classOf[test2.Foo],
+            clazz4 = classOf[LocalFoo],
+            version = 42)
+         class Bug
+      }
+    """,
+    """public @interface AnAnnotation {
+         Class<?> clazz1();
+         Class<?> clazz2();
+         Class<?> clazz3();
+         Class<?> clazz4();
+         int version();
+       }""")
+
+  @ScalaVersion(matches="2.11")
+  @Test
+  def testWithMoreComplexJavaAnnotation_minify = assertNeededImports(
+    """test1.Bar
+       test1.Foo""",
+    """package test1 {
+         class Foo
+         class Bar
+       }
+
+       package test3 {
+         import test1._
+
+         @AnAnnotation(
+            clazz1 = classOf[Foo],
+            clazz2 = classOf[Bar])
+         class Bug
+      }
+    """,
+    """public @interface AnAnnotation {
+         Class<?> clazz1();
+         Class<?> clazz2();
+       }""")
+
+  /*
+   * See https://scala-ide-portfolio.assembla.com/spaces/scala-ide/tickets/1001793-organize-imports-removes-import-referenced-from-an-annotation
+   */
+  @Ignore
+  @Test
+  def testWithSimpleJavaAnnotationAndIntConstant = assertNeededImports(
+    "test.Constants",
+    """import test._
+
+       package test {
+         object Constants {
+           final val X = 42
+         }
+       }
+
+       @AnAnnotation(Constants.X)
+       class Bug
+    """,
+    """public @interface AnAnnotation {
+         int value();
+       }""")
+
+   @Test
+   def testWithFullyQualifiedLocallyDefiniedType = assertNeededImports(
+     "",
+     """package test {
+          class LocallyDefined
+        }
+        class Test extends test.LocallyDefined""")
+
+   @Test
+   def testWithTailrecAnnotationImportNeeded = assertNeededImports(
+     "scala.annotation.tailrec",
+     """import scala.annotation.tailrec
+
+        object Test {
+          @tailrec
+          def foo = 22
+        }
+     """)
+
+   @Test
+   def testWithTailrecAnnotationImportNotNeeded = assertNeededImports(
+     "",
+     """import scala.annotation.tailrec
+
+        object Test {
+          @annotation.tailrec
+          def foo = 22
+        }
+     """)
+
+
+  @Test
+  def testWithCaseObjects = assertNeededImports(
+    """test.Hund
+       test.Ottokar
+       test.Waldemar""",
+    """package test {
+         sealed trait Hund
+         case object Waldemar extends Hund
+         case object Ottokar extends Hund
+         case class Sauhund(name: String) extends Hund
+       }
+
+       import test._
+
+      object Test {
+        def test(h: Hund) = h match {
+          case (Waldemar | Ottokar) => true
+          case _ => false
+        }
+      }""")
+
+
+  /*
+   * See Assembla ticket #1002402
+   */
+  @Test
+  def testWithTypeOnLazyVal = assertNeededImports(
+    "java.util.UUID",
+    """import java.util.UUID
+
+       class ImportsRemovedFromLazyVals2 {
+         lazy val test: UUID = ImportsFromLazyValsRemoved1.getUuid()
+       }""",
+    "",
+    """import java.util.UUID
+
+       object ImportsFromLazyValsRemoved1 {
+         def getUuid() = UUID.randomUUID()
+       }""")
+
+  @Test
+  def testWithLocalTypeThatNeedsNoImportOnLazyVal = assertNeededImports(
+    "",
+    """package test {
+         class LazyType
+         object LazyIdiot extends LazyType
+         object LazyObject {
+           lazy val l: LazyType = LazyIdiot
+         }
+       }""")
+
+  @Test
+  def testWithLocalTypeOnLazyVal = assertNeededImports(
+    """test.DarkMagic
+       test.Magic""",
+    """import test._
+
+     package test {
+       class Magic
+       object DarkMagic extends Magic
+     }
+
+     class AlwaysLazy {
+       lazy val test: Magic = DarkMagic
+     }""",
+    "")
+
+  @Test
+  def testWithoutTypeOnLazyVal = assertNeededImports(
+    "",
+    """import java.util.UUID
+
+       class ImportsRemovedFromLazyVals2 {
+         lazy val test = ImportsFromLazyValsRemoved1.getUuid()
+       }""",
+    "",
+    """import java.util.UUID
+
+       object ImportsFromLazyValsRemoved1 {
+         def getUuid() = UUID.randomUUID()
+       }""")
+
+   /*
+    * This test is related to Assembla ticket #1002511
+    */
+   @Test
+   def testWithImportInObject = assertDependencies(
+       "p1.O",
+       src = """
+         package p1
+
+         class C {
+            import O._
+
+            def f = a
+         }""",
+       addScalaSrc = """
+         package p1
+
+         object O {
+           def a: String = ???
+         }
+       """)
+
+
+   /*
+    * This test is related to Assembla ticket #1002511
+    */
+   @Test
+   def testWithScopedImports = assertDependencies(
+       "p1.O",
+       src = """
+         package p1
+
+         class C {
+            import O._
+
+            def f = a
+
+            class CC {
+              import OO._
+
+              def ff = aa
+            }
+         }""",
+       addScalaSrc = """
+         package p1
+
+         object O {
+           def a: String = ???
+           object OO {
+              def aa: String = ???
+           }
+         }
+       """)
+
+   /*
+    * This test is related to Assembla ticket #1002511
+    */
+   def testWithMoreComplexScopedImports = assertDependencies(
+       """p1.O
+          p1.O.b
+          p1.O.OO.b""",
+       src = """
+         package p1
+
+         import O.b
+         import O.OO.{bb => BB}
+
+         class C {
+            import O.a
+
+            def f = a
+            def g = b
+
+            class CC {
+              import OO.{aa => AA}
+
+              def ff = AA
+              def gg = BB
+            }
+         }""",
+       addScalaSrc = """
+         package p1
+
+         object O {
+           def a: String = ???
+           def b: String = ???
+           object OO {
+              def aa: String = ???
+              def bb: String = ???
+           }
+         }
+       """)
+
+   /*
+    * This test is related to Assembla ticket #1002512
+    */
+   @Test
+   def testWithScopedImportsOfImplicits = assertDependencies(
+       """p1.O
+          p1.X
+          p1.Y""",
+       src = """
+         package p1
+
+         class C {
+            import O._
+
+            def f: X = ""
+
+            class CC {
+              import OO._
+
+              def ff: Y = ""
+            }
+         }""",
+       addScalaSrc = """
+         package p1
+
+         object O {
+           implicit def toX(s: String): X = ???
+           object OO {
+              implicit def toY(s: String): Y = ???
+           }
+         }
+
+         class X
+         class Y
+       """)
+
+  @Test
+  def testWithLanguageFeatureImports = assertDependencies(
+      """java.net.URL
+         scala.language.implicitConversions
+         scala.language.postfixOps""",
+      src = """
+        import language.implicitConversions
+        import language.postfixOps
+        import java.net.URL
+
+        object O {
+          def urlToString(url: URL) = url toString
+        }
+      """)
+}

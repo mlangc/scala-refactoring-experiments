@@ -7,21 +7,25 @@ package tests.util
 
 import scala.Option.option2Iterable
 import scala.collection.mutable.ListBuffer
+import scala.language.postfixOps
+import scala.language.reflectiveCalls
 import scala.tools.nsc.util.FailedInterrupt
+import scala.tools.refactoring.MultiStageRefactoring
 import scala.tools.refactoring.Refactoring
 import scala.tools.refactoring.common.Change
+import scala.tools.refactoring.common.InteractiveScalaCompiler
 import scala.tools.refactoring.common.NewFileChange
+import scala.tools.refactoring.common.RenameSourceFileChange
+import scala.tools.refactoring.common.Selections
 import scala.tools.refactoring.common.TextChange
+import scala.tools.refactoring.implementations.Rename
 import scala.tools.refactoring.util.CompilerProvider
+
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
-import scala.tools.refactoring.common.InteractiveScalaCompiler
-import scala.tools.refactoring.common.Selections
-import scala.tools.refactoring.common.NewFileChange
-import scala.tools.refactoring.common.RenameSourceFileChange
-import scala.tools.refactoring.implementations.Rename
-import scala.tools.refactoring.MultiStageRefactoring
+
+import TestHelper.PrepResultWithChanges
 
 object TestHelper {
   case class PrepResultWithChanges(prepResult: Option[Either[MultiStageRefactoring#PreparationError, Rename#PreparationResult]], changes: List[Change])
@@ -234,7 +238,7 @@ trait TestHelper extends Refactoring with CompilerProvider with common.Interacti
 
         case t: global.Tree if (t.pos == global.NoPosition || t.pos.isRange) => t
 
-        case t: global.ValDef => global.emptyValDef
+        case t: global.ValDef => global.noSelfType
 
         // We want to exclude "extends AnyRef" in the pretty printer tests
         case t: global.Select if t.name.isTypeName && t.name.toString != "AnyRef" => t
