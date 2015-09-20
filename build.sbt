@@ -22,7 +22,7 @@ libraryDependencies += "com.storm-enroute" %% "scalameter" % "0.6" % "test"
 
 libraryDependencies += "junit" % "junit" % "4.12" % "test"
 
-libraryDependencies += "org.scala-refactoring" %% "org.scala-refactoring.library" % "0.7.0"
+libraryDependencies += "org.scala-refactoring" %% "org.scala-refactoring.library" % "0.7.0-SNAPSHOT"
 
 libraryDependencies += "com.google.guava" % "guava" % "18.0"
 
