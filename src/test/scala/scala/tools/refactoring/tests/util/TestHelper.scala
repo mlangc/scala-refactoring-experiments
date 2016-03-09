@@ -26,6 +26,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 
 import TestHelper.PrepResultWithChanges
+import scala.tools.refactoring.util.UniqueNames
 
 object TestHelper {
   case class PrepResultWithChanges(prepResult: Option[Either[MultiStageRefactoring#PreparationError, Rename#PreparationResult]], changes: List[Change])
@@ -54,7 +55,7 @@ trait TestHelper extends Refactoring with CompilerProvider with common.Interacti
    * sources using "add" before using any of the lazy vals.
    */
   abstract class FileSet(private val baseName: String) {
-    def this() = this(randomFileName())
+    def this() = this(UniqueNames.basename())
     private val srcs = ListBuffer[(Source, Source)]()
 
     object TaggedAsGlobalRename

@@ -1,14 +1,13 @@
 package com.github.mlangc.experiments.refactoring
 
-import org.scalameter.PerformanceTest.Quickbenchmark
+import org.scalameter.picklers.noPickler._
+import org.scalameter.api._
 import com.google.common.io.Resources
 import java.nio.file.Files
 import org.apache.commons.io.IOUtils
-import org.scalameter.Gen
-import org.scalameter.Key._
 import scala.tools.refactoring.sourcegen.SourceUtils
 
-object SourceUtilsBenchmark extends Quickbenchmark {
+object SourceUtilsBenchmark extends Bench.LocalTime {
   private case class Input(source: String) {
     override def toString = {
       "Input(...)"
@@ -39,7 +38,7 @@ object SourceUtilsBenchmark extends Quickbenchmark {
     override def name = "SourceUtils"
   }
 
-  private def runTests(adapter: SourceUtilsAdapter, testStripComment: Boolean = false, testCountBrackets: Boolean = false): Unit = {
+  private def runTests(adapter: SourceUtilsAdapter, testStripComment: Boolean = false, testCountBrackets: Boolean): Unit = {
     performance of adapter.name in {
       if (testStripComment) {
         measure method "stripComment" config(exec.benchRuns -> 500) in {

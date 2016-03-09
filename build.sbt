@@ -18,11 +18,11 @@ EclipseKeys.createSrc := EclipseCreateSrc.Default + EclipseCreateSrc.Resource
 
 libraryDependencies += "org.scala-lang" % "scala-compiler" % scalaVersion.value
 
-libraryDependencies += "com.storm-enroute" %% "scalameter" % "0.6" % "test"
+libraryDependencies += "com.storm-enroute" %% "scalameter" % "0.7" % "test"
 
 libraryDependencies += "junit" % "junit" % "4.12" % "test"
 
-libraryDependencies += "org.scala-refactoring" %% "org.scala-refactoring.library" % "0.7.0-SNAPSHOT"
+libraryDependencies += "org.scala-refactoring" %% "org.scala-refactoring.library" % "0.9.1-SNAPSHOT"
 
 libraryDependencies += "com.google.guava" % "guava" % "18.0"
 

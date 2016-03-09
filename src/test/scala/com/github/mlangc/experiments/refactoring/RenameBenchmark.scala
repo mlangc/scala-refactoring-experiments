@@ -1,6 +1,7 @@
 package com.github.mlangc.experiments.refactoring
 
-import org.scalameter.PerformanceTest.Quickbenchmark
+import org.scalameter.picklers.noPickler._
+import org.scalameter.api._
 import scala.tools.refactoring.tests.util.TestRefactoring
 import scala.tools.refactoring.implementations.Rename
 import scala.tools.refactoring.common.Change
@@ -9,7 +10,7 @@ import scala.tools.refactoring.tests.util.TestHelper.PrepResultWithChanges
 import org.scalameter.Gen
 import org.scalameter.Key.exec
 
-object RenameBenchmark extends Quickbenchmark with TestRefactoring {
+object RenameBenchmark extends Bench.LocalTime with TestRefactoring {
   private def prepareAndRenameTo(name: String)(pro: FileSet): PrepResultWithChanges = {
     val impl = new TestRefactoringImpl(pro) {
       val refactoring = new Rename with TestProjectIndex
