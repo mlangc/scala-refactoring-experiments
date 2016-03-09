@@ -5317,4 +5317,4 @@ class CompilationUnitDependenciesTest extends TestHelper with CompilationUnitDep
           def urlToString(url: URL) = url toString
         }
       """)
-}
+}/*END*/

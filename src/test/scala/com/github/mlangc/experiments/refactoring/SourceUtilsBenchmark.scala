@@ -1,13 +1,11 @@
 package com.github.mlangc.experiments.refactoring
 
-import org.scalameter.picklers.noPickler._
-import org.scalameter.api._
-import com.google.common.io.Resources
-import java.nio.file.Files
-import org.apache.commons.io.IOUtils
 import scala.tools.refactoring.sourcegen.SourceUtils
 
-object SourceUtilsBenchmark extends Bench.LocalTime {
+import org.scalameter.api._
+import org.scalameter.picklers.noPickler._
+
+object SourceUtilsBenchmark extends Bench.LocalTime with LocalResourceSupport {
   private case class Input(source: String) {
     override def toString = {
       "Input(...)"
@@ -15,7 +13,7 @@ object SourceUtilsBenchmark extends Bench.LocalTime {
   }
 
   private def testSource = {
-     IOUtils.toString(Resources.getResource(getClass, "LongScalaSource.txt"))
+    localResourceAsString("LongScalaSource.txt")
   }
 
   private val input = Gen.single("testSource")(Input(testSource))
